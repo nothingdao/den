@@ -14,11 +14,15 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{
     Axis, Block, Borders, Chart, Dataset, GraphType, List, ListItem, Paragraph, Row, Table, Tabs,
 };
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use solana_sdk::signature::{Keypair, Signer};
 
 const KEYCHAIN_SERVICE: &str = "den-wallet";
 const KEYCHAIN_ACCOUNT: &str = "main";
+const KEYCHAIN_API_KEY_ACCOUNT: &str = "helius-api-key";
+const CONFIG_DIR_NAME: &str = "den";
+const CONFIG_FILE_NAME: &str = "config.toml";
 
 const COLOR_BARK: Color = Color::Rgb(58, 46, 42);
 const COLOR_FAWN: Color = Color::Rgb(199, 181, 154);
@@ -129,6 +133,110 @@ impl Network {
     }
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+struct DenConfig {
+    #[serde(default)]
+    network: NetworkConfig,
+    #[serde(default)]
+    wallet: WalletConfig,
+    #[serde(default)]
+    display: DisplayConfig,
+}
+
+impl Default for DenConfig {
+    fn default() -> Self {
+        Self {
+            network: NetworkConfig::default(),
+            wallet: WalletConfig::default(),
+            display: DisplayConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct NetworkConfig {
+    #[serde(default = "default_network")]
+    default: String,
+}
+
+impl Default for NetworkConfig {
+    fn default() -> Self {
+        Self {
+            default: default_network(),
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct WalletConfig {
+    #[serde(default)]
+    address: String,
+}
+
+impl Default for WalletConfig {
+    fn default() -> Self {
+        Self {
+            address: String::new(),
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct DisplayConfig {
+    #[serde(default = "default_theme")]
+    theme: String,
+}
+
+impl Default for DisplayConfig {
+    fn default() -> Self {
+        Self {
+            theme: default_theme(),
+        }
+    }
+}
+
+fn default_network() -> String {
+    "mainnet".to_string()
+}
+
+fn default_theme() -> String {
+    "den".to_string()
+}
+
+fn config_path() -> Option<std::path::PathBuf> {
+    dirs::config_dir().map(|dir| dir.join(CONFIG_DIR_NAME).join(CONFIG_FILE_NAME))
+}
+
+fn load_den_config() -> DenConfig {
+    let path = match config_path() {
+        Some(path) => path,
+        None => return DenConfig::default(),
+    };
+
+    match std::fs::read_to_string(&path) {
+        Ok(contents) => toml::from_str(&contents).unwrap_or_default(),
+        Err(_) => DenConfig::default(),
+    }
+}
+
+fn save_den_config(config: &DenConfig) -> Result<(), Box<dyn Error>> {
+    let path = config_path().ok_or("Cannot determine config directory")?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let contents = toml::to_string_pretty(config)?;
+    std::fs::write(&path, contents)?;
+    Ok(())
+}
+
+fn ensure_config_exists() {
+    if let Some(path) = config_path() {
+        if !path.exists() {
+            let _ = save_den_config(&DenConfig::default());
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum InputMode {
     None,
@@ -151,6 +259,9 @@ struct App {
     wallet_address: String,
     status: String,
     keystore_status: String,
+    api_key_status: String,
+    default_network: String,
+    config_path_display: String,
     network: Network,
     input_mode: InputMode,
     input_buffer: String,
@@ -198,8 +309,13 @@ impl App {
             selected_contact: 0,
             total_balance: "0.00 SOL".to_string(),
             wallet_address: "Unset".to_string(),
-            status: "Set HELIUS_API_KEY and WALLET_ADDRESS or import a key".to_string(),
+            status: "Run: den --set-api-key <key> and import a wallet key (i)".to_string(),
             keystore_status: "Keychain: empty".to_string(),
+            api_key_status: "API Key: not set".to_string(),
+            default_network: "mainnet".to_string(),
+            config_path_display: config_path()
+                .map(|p| format!("{}", p.display()))
+                .unwrap_or_else(|| "unavailable".to_string()),
             network: Network::Mainnet,
             input_mode: InputMode::None,
             input_buffer: String::new(),
@@ -392,8 +508,19 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>) -> Result<(), Box<dyn Error>>
 }
 
 fn build_app() -> App {
+    ensure_config_exists();
+    let den_config = load_den_config();
+
+    let default_network = match den_config.network.default.as_str() {
+        "devnet" => Network::Devnet,
+        _ => Network::Mainnet,
+    };
+
     let mut app = App::new_placeholder();
+    app.network = default_network;
+    app.default_network = den_config.network.default.clone();
     app.keystore_status = keychain_status();
+    app.api_key_status = api_key_status();
 
     refresh_wallet_data(&mut app);
 
@@ -910,12 +1037,12 @@ fn render_settings(frame: &mut ratatui::prelude::Frame, area: Rect, app: &App) {
             "Network: {} (press n to toggle)",
             app.network.label()
         )),
-        Line::from("Default account: Main"),
-        Line::from("Auto-lock: 5 min"),
-        Line::from("Export logs: Disabled"),
-        Line::from("Theme: Den"),
+        Line::from(format!("Default network: {}", app.default_network)),
         Line::from(format!("Wallet address: {}", app.wallet_address)),
         Line::from(app.keystore_status.clone()),
+        Line::from(app.api_key_status.clone()),
+        Line::from(format!("Config: {}", app.config_path_display)),
+        Line::from(""),
         Line::from("Import key: press i, paste, enter"),
         Line::from("Sign message: press s, enter message"),
         Line::from(format!("Last signature: {}", app.last_signature)),
@@ -1120,10 +1247,72 @@ fn handle_cli() -> Result<bool, Box<dyn Error>> {
                 );
                 return Ok(true);
             }
+            "--set-api-key" => {
+                let key = args
+                    .next()
+                    .ok_or("Usage: den --set-api-key <KEY>")?;
+                store_api_key(&key)?;
+                println!("API key stored in Keychain.");
+                return Ok(true);
+            }
+            "--clear-api-key" => {
+                clear_api_key()?;
+                println!("API key removed from Keychain.");
+                return Ok(true);
+            }
+            "--set-network" => {
+                let net = args
+                    .next()
+                    .ok_or("Usage: den --set-network <mainnet|devnet>")?;
+                match net.as_str() {
+                    "mainnet" | "devnet" => {
+                        ensure_config_exists();
+                        let mut config = load_den_config();
+                        config.network.default = net;
+                        save_den_config(&config)?;
+                        println!("Default network saved to config.");
+                    }
+                    _ => return Err("Network must be 'mainnet' or 'devnet'".into()),
+                }
+                return Ok(true);
+            }
+            "--config-path" => {
+                match config_path() {
+                    Some(path) => println!("{}", path.display()),
+                    None => println!("Could not determine config directory"),
+                }
+                return Ok(true);
+            }
+            "--status" => {
+                ensure_config_exists();
+                println!("Den Wallet Status");
+                println!(
+                    "  Config: {}",
+                    config_path()
+                        .map(|p| {
+                            if p.exists() {
+                                format!("{}", p.display())
+                            } else {
+                                "not created yet".into()
+                            }
+                        })
+                        .unwrap_or_else(|| "unavailable".into())
+                );
+                println!("  {}", keychain_status());
+                println!("  {}", api_key_status());
+                let config = load_den_config();
+                println!("  Default network: {}", config.network.default);
+                return Ok(true);
+            }
             "--help" => {
                 println!("Den Wallet CLI");
-                println!("  --import  Store key from DEN_SECRET_KEY in Keychain");
-                println!("  --clear   Remove key from Keychain");
+                println!("  --import           Store key from DEN_SECRET_KEY in Keychain");
+                println!("  --clear            Remove private key from Keychain");
+                println!("  --set-api-key KEY  Store Helius API key in Keychain");
+                println!("  --clear-api-key    Remove API key from Keychain");
+                println!("  --set-network NET  Set default network (mainnet|devnet)");
+                println!("  --config-path      Show config file location");
+                println!("  --status           Show current configuration status");
                 return Ok(true);
             }
             _ => {}
@@ -1166,6 +1355,38 @@ fn load_secret() -> Result<String, Box<dyn Error>> {
     Ok(entry.get_password()?)
 }
 
+fn store_api_key(api_key: &str) -> Result<(), Box<dyn Error>> {
+    let entry = keyring::Entry::new(KEYCHAIN_SERVICE, KEYCHAIN_API_KEY_ACCOUNT)?;
+    entry.set_password(api_key)?;
+    Ok(())
+}
+
+fn load_api_key() -> Result<String, Box<dyn Error>> {
+    let entry = keyring::Entry::new(KEYCHAIN_SERVICE, KEYCHAIN_API_KEY_ACCOUNT)?;
+    Ok(entry.get_password()?)
+}
+
+fn clear_api_key() -> Result<(), Box<dyn Error>> {
+    let entry = keyring::Entry::new(KEYCHAIN_SERVICE, KEYCHAIN_API_KEY_ACCOUNT)?;
+    match entry.delete_password() {
+        Ok(_) => Ok(()),
+        Err(keyring::Error::NoEntry) => Ok(()),
+        Err(err) => Err(err.into()),
+    }
+}
+
+fn api_key_status() -> String {
+    let entry = match keyring::Entry::new(KEYCHAIN_SERVICE, KEYCHAIN_API_KEY_ACCOUNT) {
+        Ok(entry) => entry,
+        Err(_) => return "API Key: unavailable".to_string(),
+    };
+    match entry.get_password() {
+        Ok(_) => "API Key: stored".to_string(),
+        Err(keyring::Error::NoEntry) => "API Key: not set".to_string(),
+        Err(_) => "API Key: error".to_string(),
+    }
+}
+
 fn keypair_from_secret(secret: &str) -> Result<Keypair, Box<dyn Error>> {
     let trimmed = secret.trim();
 
@@ -1204,7 +1425,8 @@ fn derive_address_from_keychain() -> Result<String, String> {
 
 fn refresh_wallet_data(app: &mut App) {
     app.keystore_status = keychain_status();
-    match Config::from_env(app.network) {
+    app.api_key_status = api_key_status();
+    match Config::load(app.network) {
         Ok(config) => {
             app.wallet_address = short_address(&config.address);
             match fetch_wallet_data(&config) {
@@ -1217,15 +1439,24 @@ fn refresh_wallet_data(app: &mut App) {
 }
 
 impl Config {
-    fn from_env(network: Network) -> Result<Self, String> {
-        let api_key = std::env::var("HELIUS_API_KEY").ok();
-        let address = std::env::var("WALLET_ADDRESS").ok();
+    fn load(network: Network) -> Result<Self, String> {
+        let den_config = load_den_config();
 
-        let api_key = api_key.ok_or_else(|| "Set HELIUS_API_KEY for live data".to_string())?;
-        let address = match address {
-            Some(address) => address,
-            None => derive_address_from_keychain()?,
-        };
+        // API key: env > keychain
+        let api_key = std::env::var("HELIUS_API_KEY")
+            .ok()
+            .or_else(|| load_api_key().ok())
+            .ok_or_else(|| "No API key. Run: den --set-api-key <key>".to_string())?;
+
+        // Address: env > config file > keychain-derived
+        let address = std::env::var("WALLET_ADDRESS")
+            .ok()
+            .or_else(|| {
+                let addr = den_config.wallet.address.clone();
+                if addr.is_empty() { None } else { Some(addr) }
+            })
+            .or_else(|| derive_address_from_keychain().ok())
+            .ok_or_else(|| "No wallet address. Import a key (i) or run: den --import".to_string())?;
 
         let rpc_url = match network {
             Network::Mainnet => format!("https://rpc.helius.xyz/?api-key={}", api_key),
@@ -1242,84 +1473,139 @@ impl Config {
 
 fn fetch_wallet_data(config: &Config) -> Result<WalletData, Box<dyn Error>> {
     let client = reqwest::blocking::Client::new();
-    let sol_balance = rpc_get_balance(&client, &config.rpc_url, &config.address)?;
-    let mut tokens = Vec::new();
 
-    tokens.push(Token {
-        symbol: "SOL".to_string(),
-        balance: format!("{:.4}", sol_balance),
-        value: "-".to_string(),
-        history: seeded_series("SOL", 16),
-    });
-
-    let mut token_list = rpc_get_tokens(&client, &config.rpc_url, &config.address)?;
-    tokens.append(&mut token_list);
+    let das_result = das_get_assets(&client, &config.rpc_url, &config.address)?;
 
     let history = rpc_get_history(&client, &config.rpc_url, &config.address)?;
 
     Ok(WalletData {
-        sol_balance,
-        tokens,
+        sol_balance: das_result.sol_balance,
+        tokens: das_result.tokens,
         history,
     })
 }
 
-fn rpc_get_balance(
-    client: &reqwest::blocking::Client,
-    url: &str,
-    address: &str,
-) -> Result<f64, Box<dyn Error>> {
-    let result = rpc_call(client, url, "getBalance", json!([address]))?;
-    let lamports = result
-        .get("value")
-        .and_then(|value| value.as_u64())
-        .unwrap_or(0);
-    Ok(lamports as f64 / 1_000_000_000.0)
+struct DasResult {
+    sol_balance: f64,
+    tokens: Vec<Token>,
 }
 
-fn rpc_get_tokens(
+fn das_get_assets(
     client: &reqwest::blocking::Client,
     url: &str,
     address: &str,
-) -> Result<Vec<Token>, Box<dyn Error>> {
-    let params = json!([
-        address,
-        { "programId": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA" },
-        { "encoding": "jsonParsed" }
-    ]);
-    let result = rpc_call(client, url, "getTokenAccountsByOwner", params)?;
-    let mut tokens = Vec::new();
+) -> Result<DasResult, Box<dyn Error>> {
+    let params = json!({
+        "ownerAddress": address,
+        "page": 1,
+        "limit": 1000,
+        "displayOptions": {
+            "showFungible": true,
+            "showNativeBalance": true
+        }
+    });
 
-    if let Some(values) = result.get("value").and_then(|value| value.as_array()) {
-        for item in values {
-            let info = item
-                .get("account")
-                .and_then(|account| account.get("data"))
-                .and_then(|data| data.get("parsed"))
-                .and_then(|parsed| parsed.get("info"));
+    let result = rpc_call(client, url, "getAssetsByOwner", params)?;
 
-            let mint = info
-                .and_then(|info| info.get("mint"))
-                .and_then(|mint| mint.as_str())
-                .unwrap_or("Unknown");
+    // Native SOL balance
+    let sol_balance = result
+        .get("nativeBalance")
+        .and_then(|nb| nb.get("lamports"))
+        .and_then(|l| l.as_u64())
+        .map(|l| l as f64 / 1_000_000_000.0)
+        .unwrap_or(0.0);
 
-            let amount = info
-                .and_then(|info| info.get("tokenAmount"))
-                .and_then(|amount| amount.get("uiAmountString"))
-                .and_then(|amount| amount.as_str())
-                .unwrap_or("0");
+    let sol_price = result
+        .get("nativeBalance")
+        .and_then(|nb| nb.get("price_per_sol"))
+        .and_then(|p| p.as_f64());
 
-            let symbol = short_address(mint);
+    let sol_value = match sol_price {
+        Some(price) => format!("${:.2}", sol_balance * price),
+        None => "-".to_string(),
+    };
+
+    let mut tokens = vec![Token {
+        symbol: "SOL".to_string(),
+        balance: format!("{:.4}", sol_balance),
+        value: sol_value,
+        history: seeded_series("SOL", 16),
+    }];
+
+    // Fungible tokens from DAS
+    if let Some(items) = result.get("items").and_then(|i| i.as_array()) {
+        for item in items {
+            let interface = item
+                .get("interface")
+                .and_then(|i| i.as_str())
+                .unwrap_or("");
+
+            // Skip non-fungible assets
+            if interface != "FungibleToken" && interface != "FungibleAsset" {
+                continue;
+            }
+
+            let token_info = match item.get("token_info") {
+                Some(ti) => ti,
+                None => continue,
+            };
+
+            let symbol = item
+                .get("content")
+                .and_then(|c| c.get("metadata"))
+                .and_then(|m| m.get("symbol"))
+                .and_then(|s| s.as_str())
+                .unwrap_or_else(|| {
+                    item.get("id")
+                        .and_then(|id| id.as_str())
+                        .unwrap_or("???")
+                });
+
+            let decimals = token_info
+                .get("decimals")
+                .and_then(|d| d.as_u64())
+                .unwrap_or(0);
+
+            let raw_balance = token_info
+                .get("balance")
+                .and_then(|b| b.as_u64())
+                .unwrap_or(0);
+
+            let ui_balance = raw_balance as f64 / 10f64.powi(decimals as i32);
+
+            let price_per_token = token_info
+                .get("price_info")
+                .and_then(|pi| pi.get("price_per_token"))
+                .and_then(|p| p.as_f64());
+
+            let value = match price_per_token {
+                Some(price) => format!("${:.2}", ui_balance * price),
+                None => "-".to_string(),
+            };
+
+            let display_symbol = symbol.to_string();
             tokens.push(Token {
-                symbol: symbol.clone(),
-                balance: amount.to_string(),
-                value: "-".to_string(),
-                history: seeded_series(&symbol, 16),
+                symbol: display_symbol.clone(),
+                balance: format_token_balance(ui_balance, decimals),
+                value,
+                history: seeded_series(&display_symbol, 16),
             });
         }
     }
 
-    Ok(tokens)
+    Ok(DasResult { sol_balance, tokens })
+}
+
+fn format_token_balance(balance: f64, decimals: u64) -> String {
+    if balance == 0.0 {
+        return "0".to_string();
+    }
+    let precision = match decimals {
+        0 => 0,
+        1..=4 => decimals as usize,
+        _ => 4,
+    };
+    format!("{:.prec$}", balance, prec = precision)
 }
 
 fn rpc_get_history(
