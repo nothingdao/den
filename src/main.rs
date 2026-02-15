@@ -1,5 +1,7 @@
 use std::error::Error;
+use std::fs;
 use std::io;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
@@ -14,6 +16,7 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{
     Axis, Block, Borders, Chart, Dataset, GraphType, List, ListItem, Paragraph, Row, Table, Tabs,
 };
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use solana_sdk::signature::{Keypair, Signer};
 
@@ -90,6 +93,7 @@ struct Transaction {
     amount: String,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
 struct Contact {
     name: String,
     address: String,
@@ -105,6 +109,12 @@ struct Config {
     api_key: String,
     address: String,
     rpc_url: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct ContactsConfig {
+    version: u32,
+    contacts: Vec<Contact>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -159,6 +169,8 @@ struct App {
 
 impl App {
     fn new_placeholder() -> Self {
+        let contacts = load_contacts().unwrap_or_else(|_| default_contacts());
+        
         Self {
             should_quit: false,
             tab: Tab::Overview,
@@ -178,20 +190,7 @@ impl App {
                 summary: "No transactions".to_string(),
                 amount: "".to_string(),
             }],
-            contacts: vec![
-                Contact {
-                    name: "Trader Joe".to_string(),
-                    address: "Den9k...9aX1".to_string(),
-                },
-                Contact {
-                    name: "Ops Vault".to_string(),
-                    address: "Den5m...7bN2".to_string(),
-                },
-                Contact {
-                    name: "Laptop".to_string(),
-                    address: "Den2g...2gP8".to_string(),
-                },
-            ],
+            contacts,
             selected_account: 0,
             selected_token: 0,
             selected_history: 0,
@@ -387,6 +386,9 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>) -> Result<(), Box<dyn Error>>
             }
         }
     }
+
+    // Save contacts before exiting
+    let _ = save_contacts(&app.contacts);
 
     Ok(())
 }
@@ -1120,10 +1122,43 @@ fn handle_cli() -> Result<bool, Box<dyn Error>> {
                 );
                 return Ok(true);
             }
+            "--add-contact" => {
+                let name = args.next().ok_or("--add-contact requires name and address")?;
+                let address = args.next().ok_or("--add-contact requires name and address")?;
+                
+                let mut contacts = load_contacts().unwrap_or_else(|_| default_contacts());
+                contacts.push(Contact { name, address });
+                save_contacts(&contacts)?;
+                println!("Contact added successfully");
+                return Ok(true);
+            }
+            "--remove-contact" => {
+                let name = args.next().ok_or("--remove-contact requires contact name")?;
+                let mut contacts = load_contacts().unwrap_or_else(|_| default_contacts());
+                contacts.retain(|c| c.name != name);
+                save_contacts(&contacts)?;
+                println!("Contact removed successfully");
+                return Ok(true);
+            }
+            "--list-contacts" => {
+                let contacts = load_contacts().unwrap_or_else(|_| default_contacts());
+                if contacts.is_empty() {
+                    println!("No contacts found");
+                } else {
+                    println!("Address Book:");
+                    for contact in contacts {
+                        println!("  {} -> {}", contact.name, contact.address);
+                    }
+                }
+                return Ok(true);
+            }
             "--help" => {
                 println!("Den Wallet CLI");
-                println!("  --import  Store key from DEN_SECRET_KEY in Keychain");
-                println!("  --clear   Remove key from Keychain");
+                println!("  --import              Store key from DEN_SECRET_KEY in Keychain");
+                println!("  --clear               Remove key from Keychain");
+                println!("  --add-contact <name> <addr>   Add a contact");
+                println!("  --remove-contact <name>       Remove a contact");
+                println!("  --list-contacts               List all contacts");
                 return Ok(true);
             }
             _ => {}
@@ -1384,4 +1419,68 @@ fn short_address(value: &str) -> String {
         return value.to_string();
     }
     format!("{}...{}", &value[..4], &value[length - 4..])
+}
+
+fn contacts_config_path() -> Result<PathBuf, Box<dyn Error>> {
+    let config_home = std::env::var("XDG_CONFIG_HOME")
+        .ok()
+        .or_else(|| {
+            std::env::var("HOME").ok().map(|home| {
+                format!("{}/.config", home)
+            })
+        })
+        .unwrap_or_else(|| ".config".to_string());
+
+    let config_dir = PathBuf::from(config_home).join("den");
+    fs::create_dir_all(&config_dir)?;
+    Ok(config_dir.join("contacts.json"))
+}
+
+fn default_contacts() -> Vec<Contact> {
+    vec![
+        Contact {
+            name: "Trader Joe".to_string(),
+            address: "Den9k...9aX1".to_string(),
+        },
+        Contact {
+            name: "Ops Vault".to_string(),
+            address: "Den5m...7bN2".to_string(),
+        },
+        Contact {
+            name: "Laptop".to_string(),
+            address: "Den2g...2gP8".to_string(),
+        },
+    ]
+}
+
+fn load_contacts() -> Result<Vec<Contact>, Box<dyn Error>> {
+    let path = contacts_config_path()?;
+
+    if path.exists() {
+        let content = fs::read_to_string(&path)?;
+        let config: ContactsConfig = serde_json::from_str(&content)?;
+        return Ok(config.contacts);
+    }
+
+    // First run: create default config
+    let contacts = default_contacts();
+    let config = ContactsConfig {
+        version: 1,
+        contacts: contacts.clone(),
+    };
+    let content = serde_json::to_string_pretty(&config)?;
+    fs::write(&path, content)?;
+
+    Ok(contacts)
+}
+
+fn save_contacts(contacts: &[Contact]) -> Result<(), Box<dyn Error>> {
+    let path = contacts_config_path()?;
+    let config = ContactsConfig {
+        version: 1,
+        contacts: contacts.to_vec(),
+    };
+    let content = serde_json::to_string_pretty(&config)?;
+    fs::write(&path, content)?;
+    Ok(())
 }
