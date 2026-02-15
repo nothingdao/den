@@ -21,7 +21,6 @@ use serde_json::json;
 use solana_sdk::signature::{Keypair, Signer};
 
 const KEYCHAIN_SERVICE: &str = "den-wallet";
-const KEYCHAIN_ACCOUNT: &str = "main";
 const KEYCHAIN_API_KEY_ACCOUNT: &str = "helius-api-key";
 const CONFIG_DIR_NAME: &str = "den";
 const CONFIG_FILE_NAME: &str = "config.toml";
@@ -85,9 +84,12 @@ struct Token {
 }
 
 struct Account {
+    id: String,
     name: String,
     address: String,
     balance: String,
+    has_key: bool,
+    is_active: bool,
 }
 
 struct Transaction {
@@ -147,19 +149,40 @@ struct DenConfig {
     #[serde(default)]
     network: NetworkConfig,
     #[serde(default)]
-    wallet: WalletConfig,
-    #[serde(default)]
     display: DisplayConfig,
+    #[serde(default)]
+    active_wallet: Option<String>,
+    #[serde(default)]
+    wallets: Vec<WalletEntry>,
+    #[serde(default, skip_serializing)]
+    wallet: Option<LegacyWalletConfig>,
 }
 
 impl Default for DenConfig {
     fn default() -> Self {
         Self {
             network: NetworkConfig::default(),
-            wallet: WalletConfig::default(),
             display: DisplayConfig::default(),
+            active_wallet: None,
+            wallets: Vec::new(),
+            wallet: None,
         }
     }
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+struct WalletEntry {
+    id: String,
+    name: String,
+    address: String,
+    #[serde(default)]
+    has_key: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct LegacyWalletConfig {
+    #[serde(default)]
+    address: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -172,20 +195,6 @@ impl Default for NetworkConfig {
     fn default() -> Self {
         Self {
             default: default_network(),
-        }
-    }
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct WalletConfig {
-    #[serde(default)]
-    address: String,
-}
-
-impl Default for WalletConfig {
-    fn default() -> Self {
-        Self {
-            address: String::new(),
         }
     }
 }
@@ -222,9 +231,89 @@ fn load_den_config() -> DenConfig {
         None => return DenConfig::default(),
     };
 
-    match std::fs::read_to_string(&path) {
+    let mut config: DenConfig = match std::fs::read_to_string(&path) {
         Ok(contents) => toml::from_str(&contents).unwrap_or_default(),
         Err(_) => DenConfig::default(),
+    };
+
+    if migrate_config_if_needed(&mut config) {
+        let _ = save_den_config(&config);
+    }
+
+    config
+}
+
+fn migrate_config_if_needed(config: &mut DenConfig) -> bool {
+    let legacy = match config.wallet.take() {
+        Some(legacy) => legacy,
+        None => return false,
+    };
+
+    if !config.wallets.is_empty() {
+        return false;
+    }
+
+    let has_key = keyring::Entry::new(KEYCHAIN_SERVICE, "main")
+        .and_then(|e| e.get_password())
+        .is_ok();
+
+    let address = if !legacy.address.is_empty() {
+        legacy.address
+    } else if has_key {
+        load_secret_for_wallet("main")
+            .ok()
+            .and_then(|s| keypair_from_secret(&s).ok())
+            .map(|kp| kp.pubkey().to_string())
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
+
+    if address.is_empty() {
+        return false;
+    }
+
+    let wallet_id = "wallet-0".to_string();
+
+    if has_key {
+        if let Ok(secret) = load_secret_for_wallet("main") {
+            let _ = store_secret_for_wallet(&wallet_id, &secret);
+        }
+    }
+
+    config.wallets.push(WalletEntry {
+        id: wallet_id.clone(),
+        name: "Main".to_string(),
+        address,
+        has_key,
+    });
+    config.active_wallet = Some(wallet_id);
+
+    true
+}
+
+fn next_wallet_id(config: &DenConfig) -> String {
+    let max = config
+        .wallets
+        .iter()
+        .filter_map(|w| w.id.strip_prefix("wallet-"))
+        .filter_map(|s| s.parse::<u32>().ok())
+        .max();
+    match max {
+        Some(n) => format!("wallet-{}", n + 1),
+        None if config.wallets.is_empty() => "wallet-0".to_string(),
+        None => format!("wallet-{}", config.wallets.len()),
+    }
+}
+
+fn active_wallet(config: &DenConfig) -> Option<&WalletEntry> {
+    let active_id = config.active_wallet.as_deref()?;
+    config.wallets.iter().find(|w| w.id == active_id)
+}
+
+fn set_active_wallet(config: &mut DenConfig, wallet_id: &str) {
+    if config.wallets.iter().any(|w| w.id == wallet_id) {
+        config.active_wallet = Some(wallet_id.to_string());
     }
 }
 
@@ -249,8 +338,17 @@ fn ensure_config_exists() {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum InputMode {
     None,
+    ImportKeyName,
     ImportKey,
+    AddWatchOnlyName,
+    AddWatchOnly,
+    RenameWallet,
+    ConfirmDeleteWallet,
     SignMessage,
+}
+
+struct ImportState {
+    wallet_name: String,
 }
 
 struct App {
@@ -266,6 +364,7 @@ struct App {
     selected_contact: usize,
     total_balance: String,
     wallet_address: String,
+    active_wallet_id: Option<String>,
     status: String,
     keystore_status: String,
     api_key_status: String,
@@ -274,6 +373,7 @@ struct App {
     network: Network,
     input_mode: InputMode,
     input_buffer: String,
+    import_state: ImportState,
     last_signature: String,
 }
 
@@ -284,11 +384,7 @@ impl App {
         Self {
             should_quit: false,
             tab: Tab::Overview,
-            accounts: vec![Account {
-                name: "Main".to_string(),
-                address: "Unset".to_string(),
-                balance: "0.00 SOL".to_string(),
-            }],
+            accounts: Vec::new(),
             tokens: vec![Token {
                 symbol: "SOL".to_string(),
                 balance: "0.00".to_string(),
@@ -307,8 +403,9 @@ impl App {
             selected_contact: 0,
             total_balance: "0.00 SOL".to_string(),
             wallet_address: "Unset".to_string(),
-            status: "Run: den --set-api-key <key> and import a wallet key (i)".to_string(),
-            keystore_status: "Keychain: empty".to_string(),
+            active_wallet_id: None,
+            status: "Add a wallet: press 'a' on Accounts tab or run: den --add-wallet <name>".to_string(),
+            keystore_status: "Keychain: no wallets".to_string(),
             api_key_status: "API Key: not set".to_string(),
             default_network: "mainnet".to_string(),
             config_path_display: config_path()
@@ -317,18 +414,15 @@ impl App {
             network: Network::Mainnet,
             input_mode: InputMode::None,
             input_buffer: String::new(),
+            import_state: ImportState {
+                wallet_name: String::new(),
+            },
             last_signature: "-".to_string(),
         }
     }
 
-    fn apply_data(&mut self, address: &str, data: WalletData) {
-        self.wallet_address = short_address(address);
+    fn apply_active_data(&mut self, data: WalletData) {
         self.total_balance = format!("{:.4} SOL", data.sol_balance);
-        self.accounts = vec![Account {
-            name: "Main".to_string(),
-            address: self.wallet_address.clone(),
-            balance: self.total_balance.clone(),
-        }];
         self.tokens = data.tokens;
         self.history = if data.history.is_empty() {
             vec![Transaction {
@@ -368,13 +462,56 @@ impl App {
             KeyCode::Char('r') => {
                 refresh_wallet_data(self);
             }
-            KeyCode::Char('i') => {
-                self.input_mode = InputMode::ImportKey;
+            KeyCode::Char('i') | KeyCode::Char('a') => {
+                self.input_mode = InputMode::ImportKeyName;
                 self.input_buffer.clear();
+                self.import_state.wallet_name.clear();
+            }
+            KeyCode::Char('w') => {
+                if self.tab == Tab::Accounts {
+                    self.input_mode = InputMode::AddWatchOnlyName;
+                    self.input_buffer.clear();
+                    self.import_state.wallet_name.clear();
+                }
+            }
+            KeyCode::Char('e') => {
+                if self.tab == Tab::Accounts && !self.accounts.is_empty() {
+                    self.input_mode = InputMode::RenameWallet;
+                    self.input_buffer = self.accounts[self.selected_account].name.clone();
+                }
+            }
+            KeyCode::Char('d') => {
+                if self.tab == Tab::Accounts && !self.accounts.is_empty() {
+                    self.input_mode = InputMode::ConfirmDeleteWallet;
+                    self.input_buffer.clear();
+                }
+            }
+            KeyCode::Enter => {
+                if self.tab == Tab::Accounts && !self.accounts.is_empty() {
+                    let selected = &self.accounts[self.selected_account];
+                    let wallet_id = selected.id.clone();
+                    let wallet_name = selected.name.clone();
+                    let mut config = load_den_config();
+                    set_active_wallet(&mut config, &wallet_id);
+                    let _ = save_den_config(&config);
+                    self.status = format!("Switched to '{}'", wallet_name);
+                    refresh_wallet_data(self);
+                }
             }
             KeyCode::Char('s') => {
-                self.input_mode = InputMode::SignMessage;
-                self.input_buffer.clear();
+                let config = load_den_config();
+                match active_wallet(&config) {
+                    Some(w) if w.has_key => {
+                        self.input_mode = InputMode::SignMessage;
+                        self.input_buffer.clear();
+                    }
+                    Some(w) => {
+                        self.status = format!("Cannot sign: '{}' is watch-only", w.name);
+                    }
+                    None => {
+                        self.status = "No active wallet".to_string();
+                    }
+                }
             }
             _ => {}
         }
@@ -389,33 +526,143 @@ impl App {
             KeyCode::Enter => {
                 let input = self.input_buffer.trim().to_string();
                 match self.input_mode {
+                    InputMode::ImportKeyName => {
+                        if input.is_empty() {
+                            self.status = "Import cancelled".to_string();
+                        } else {
+                            self.import_state.wallet_name = input;
+                            self.input_mode = InputMode::ImportKey;
+                            self.input_buffer.clear();
+                            return;
+                        }
+                    }
                     InputMode::ImportKey => {
                         if input.is_empty() {
                             self.status = "Import cancelled".to_string();
                         } else {
-                            match store_secret(&input) {
-                                Ok(_) => {
-                                    self.status = "Key stored in Keychain".to_string();
-                                    self.keystore_status = keychain_status();
-                                    refresh_wallet_data(self);
+                            match keypair_from_secret(&input) {
+                                Ok(keypair) => {
+                                    let address = keypair.pubkey().to_string();
+                                    let mut config = load_den_config();
+                                    let wallet_id = next_wallet_id(&config);
+                                    let name = if self.import_state.wallet_name.is_empty() {
+                                        format!("Wallet {}", config.wallets.len())
+                                    } else {
+                                        self.import_state.wallet_name.clone()
+                                    };
+                                    match store_secret_for_wallet(&wallet_id, &input) {
+                                        Ok(_) => {
+                                            config.wallets.push(WalletEntry {
+                                                id: wallet_id.clone(),
+                                                name: name.clone(),
+                                                address,
+                                                has_key: true,
+                                            });
+                                            if config.active_wallet.is_none() {
+                                                config.active_wallet = Some(wallet_id);
+                                            }
+                                            let _ = save_den_config(&config);
+                                            self.status = format!("Wallet '{}' imported", name);
+                                            refresh_wallet_data(self);
+                                        }
+                                        Err(err) => {
+                                            self.status = format!("Keychain error: {}", err);
+                                        }
+                                    }
                                 }
                                 Err(err) => {
-                                    self.status = format!("Key import failed: {}", err);
+                                    self.status = format!("Invalid key: {}", err);
                                 }
                             }
+                        }
+                    }
+                    InputMode::AddWatchOnlyName => {
+                        if input.is_empty() {
+                            self.status = "Cancelled".to_string();
+                        } else {
+                            self.import_state.wallet_name = input;
+                            self.input_mode = InputMode::AddWatchOnly;
+                            self.input_buffer.clear();
+                            return;
+                        }
+                    }
+                    InputMode::AddWatchOnly => {
+                        if input.is_empty() {
+                            self.status = "Cancelled".to_string();
+                        } else {
+                            let mut config = load_den_config();
+                            let wallet_id = next_wallet_id(&config);
+                            let name = self.import_state.wallet_name.clone();
+                            config.wallets.push(WalletEntry {
+                                id: wallet_id.clone(),
+                                name: name.clone(),
+                                address: input,
+                                has_key: false,
+                            });
+                            if config.active_wallet.is_none() {
+                                config.active_wallet = Some(wallet_id);
+                            }
+                            let _ = save_den_config(&config);
+                            self.status = format!("Watch-only wallet '{}' added", name);
+                            refresh_wallet_data(self);
+                        }
+                    }
+                    InputMode::RenameWallet => {
+                        if input.is_empty() {
+                            self.status = "Rename cancelled".to_string();
+                        } else if !self.accounts.is_empty() {
+                            let wallet_id = self.accounts[self.selected_account].id.clone();
+                            let mut config = load_den_config();
+                            if let Some(w) = config.wallets.iter_mut().find(|w| w.id == wallet_id) {
+                                w.name = input.clone();
+                                let _ = save_den_config(&config);
+                                self.status = format!("Renamed to '{}'", input);
+                                refresh_wallet_data(self);
+                            }
+                        }
+                    }
+                    InputMode::ConfirmDeleteWallet => {
+                        if (input == "y" || input == "yes") && !self.accounts.is_empty() {
+                            let selected = &self.accounts[self.selected_account];
+                            let wallet_id = selected.id.clone();
+                            let wallet_name = selected.name.clone();
+                            let had_key = selected.has_key;
+                            let mut config = load_den_config();
+                            config.wallets.retain(|w| w.id != wallet_id);
+                            if config.active_wallet.as_deref() == Some(wallet_id.as_str()) {
+                                config.active_wallet =
+                                    config.wallets.first().map(|w| w.id.clone());
+                            }
+                            if had_key {
+                                let _ = clear_secret_for_wallet(&wallet_id);
+                            }
+                            let _ = save_den_config(&config);
+                            self.selected_account = 0;
+                            self.status = format!("Wallet '{}' removed", wallet_name);
+                            refresh_wallet_data(self);
+                        } else {
+                            self.status = "Delete cancelled".to_string();
                         }
                     }
                     InputMode::SignMessage => {
                         if input.is_empty() {
                             self.status = "Sign cancelled".to_string();
                         } else {
-                            match sign_message(&input) {
-                                Ok(signature) => {
-                                    self.last_signature = signature;
-                                    self.status = "Message signed".to_string();
+                            let config = load_den_config();
+                            match active_wallet(&config) {
+                                Some(w) if w.has_key => {
+                                    match sign_message_with_wallet(&w.id, &input) {
+                                        Ok(signature) => {
+                                            self.last_signature = signature;
+                                            self.status = "Message signed".to_string();
+                                        }
+                                        Err(err) => {
+                                            self.status = format!("Sign failed: {}", err);
+                                        }
+                                    }
                                 }
-                                Err(err) => {
-                                    self.status = format!("Sign failed: {}", err);
+                                _ => {
+                                    self.status = "No signing key available".to_string();
                                 }
                             }
                         }
@@ -520,7 +767,7 @@ fn build_app() -> App {
     let mut app = App::new_placeholder();
     app.network = default_network;
     app.default_network = den_config.network.default.clone();
-    app.keystore_status = keychain_status();
+    app.keystore_status = keychain_status_summary(&den_config);
     app.api_key_status = api_key_status();
 
     refresh_wallet_data(&mut app);
@@ -551,7 +798,7 @@ fn ui(frame: &mut ratatui::prelude::Frame, app: &App) {
     render_header(frame, layout[0], app.tab, area.width, app.network);
     render_body(frame, layout[1], app, area.width);
     if footer_height > 0 {
-        render_footer(frame, layout[2], &app.status, footer_height);
+        render_footer(frame, layout[2], &app.status, footer_height, app.tab);
     }
 
     if app.input_mode != InputMode::None {
@@ -727,23 +974,27 @@ fn render_overview(frame: &mut ratatui::prelude::Frame, area: Rect, app: &App, w
 
 fn render_accounts(frame: &mut ratatui::prelude::Frame, area: Rect, app: &App) {
     let rows = app.accounts.iter().map(|account| {
+        let marker = if account.is_active { "*" } else { " " };
+        let wallet_type = if account.has_key { "Full" } else { "Watch" };
         Row::new(vec![
-            account.name.as_str(),
-            account.address.as_str(),
-            account.balance.as_str(),
+            format!("{} {}", marker, account.name),
+            short_address(&account.address),
+            account.balance.clone(),
+            wallet_type.to_string(),
         ])
     });
 
     let table = Table::new(
         rows,
         [
-            Constraint::Percentage(30),
-            Constraint::Percentage(45),
             Constraint::Percentage(25),
+            Constraint::Percentage(25),
+            Constraint::Percentage(30),
+            Constraint::Percentage(20),
         ],
     )
     .header(
-        Row::new(vec!["Name", "Address", "Balance"]).style(
+        Row::new(vec!["Name", "Address", "Balance", "Type"]).style(
             Style::default()
                 .fg(COLOR_FAWN)
                 .bg(COLOR_BARK)
@@ -754,7 +1005,7 @@ fn render_accounts(frame: &mut ratatui::prelude::Frame, area: Rect, app: &App) {
         Block::default()
             .borders(Borders::ALL)
             .border_style(Style::default().fg(COLOR_BARK))
-            .title("Accounts"),
+            .title("Wallets [Enter:switch a:add w:watch e:rename d:delete]"),
     )
     .row_highlight_style(
         Style::default()
@@ -950,7 +1201,25 @@ fn render_address_book(frame: &mut ratatui::prelude::Frame, area: Rect, app: &Ap
 }
 
 fn render_send(frame: &mut ratatui::prelude::Frame, area: Rect, app: &App) {
-    let (account_name, account_address) = primary_account(app);
+    if let Some(acc) = app.accounts.iter().find(|a| a.is_active) {
+        if !acc.has_key {
+            let notice = Paragraph::new(
+                "Watch-only wallet -- signing not available.\nSwitch to a full wallet to send.",
+            )
+            .alignment(Alignment::Center)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(COLOR_BARK))
+                    .title("Send"),
+            )
+            .style(Style::default().fg(COLOR_EMBER));
+            frame.render_widget(notice, area);
+            return;
+        }
+    }
+
+    let (account_name, account_address) = active_account(app);
 
     let layout = Layout::default()
         .direction(Direction::Vertical)
@@ -1010,7 +1279,7 @@ fn render_send(frame: &mut ratatui::prelude::Frame, area: Rect, app: &App) {
 }
 
 fn render_receive(frame: &mut ratatui::prelude::Frame, area: Rect, app: &App) {
-    let (account_name, account_address) = primary_account(app);
+    let (account_name, account_address) = active_account(app);
 
     let receive = Text::from(vec![
         Line::from(format!("Account: {}", account_name)),
@@ -1061,12 +1330,23 @@ fn render_settings(frame: &mut ratatui::prelude::Frame, area: Rect, app: &App) {
     frame.render_widget(paragraph, area);
 }
 
-fn render_footer(frame: &mut ratatui::prelude::Frame, area: Rect, status: &str, height: u16) {
+fn footer_nav_text(tab: Tab) -> &'static str {
+    match tab {
+        Tab::Accounts => "1-8 | Enter:switch | a:add | w:watch | e:rename | d:delete | r:refresh | q:quit",
+        _ => "1-8 | up/down | n:network | i:import | s:sign | r:refresh | q:quit",
+    }
+}
+
+fn render_footer(
+    frame: &mut ratatui::prelude::Frame,
+    area: Rect,
+    status: &str,
+    height: u16,
+    tab: Tab,
+) {
+    let nav_text = footer_nav_text(tab);
     if height == 1 {
-        let content = format!(
-            "nav: 1-8 switch | up/down list | n network | i import | s sign | r refresh | q quit | {}",
-            status
-        );
+        let content = format!("{} | {}", nav_text, status);
         let footer = Paragraph::new(content)
             .alignment(Alignment::Center)
             .block(
@@ -1084,11 +1364,9 @@ fn render_footer(frame: &mut ratatui::prelude::Frame, area: Rect, status: &str, 
         .constraints([Constraint::Length(1), Constraint::Length(1)])
         .split(area);
 
-    let nav = Paragraph::new(
-        "nav: 1-8 switch | up/down list | n network | i import | s sign | r refresh | q quit",
-    )
-    .alignment(Alignment::Center)
-    .style(Style::default().fg(COLOR_ASH));
+    let nav = Paragraph::new(nav_text)
+        .alignment(Alignment::Center)
+        .style(Style::default().fg(COLOR_ASH));
     let status_line = Paragraph::new(status)
         .alignment(Alignment::Center)
         .style(status_style(status));
@@ -1115,11 +1393,12 @@ fn table_state(selected: usize) -> ratatui::widgets::TableState {
     state
 }
 
-fn primary_account(app: &App) -> (String, String) {
+fn active_account(app: &App) -> (String, String) {
     app.accounts
-        .first()
-        .map(|account| (account.name.clone(), account.address.clone()))
-        .unwrap_or_else(|| ("Main".to_string(), "Unset".to_string()))
+        .iter()
+        .find(|a| a.is_active)
+        .map(|a| (a.name.clone(), short_address(&a.address)))
+        .unwrap_or_else(|| ("None".to_string(), "Unset".to_string()))
 }
 
 fn render_input_modal(frame: &mut ratatui::prelude::Frame, app: &App) {
@@ -1130,21 +1409,57 @@ fn render_input_modal(frame: &mut ratatui::prelude::Frame, app: &App) {
     let y = area.y + (area.height.saturating_sub(modal_height)) / 2;
     let modal = Rect::new(x, y, modal_width, modal_height);
 
-    let (title, prompt, display) = match app.input_mode {
-        InputMode::ImportKey => {
-            let masked = "*".repeat(app.input_buffer.len());
-            ("Import Key", "Paste secret key and press Enter", masked)
-        }
-        InputMode::SignMessage => (
-            "Sign Message",
-            "Enter message and press Enter",
+    let delete_name = app
+        .accounts
+        .get(app.selected_account)
+        .map(|a| a.name.clone())
+        .unwrap_or_else(|| "?".to_string());
+    let delete_prompt = format!("Delete '{}'? Type 'y' to confirm:", delete_name);
+
+    let (title, prompt, display): (&str, String, String) = match app.input_mode {
+        InputMode::ImportKeyName => (
+            "Add Wallet",
+            "Enter a name for this wallet:".to_string(),
             app.input_buffer.clone(),
         ),
-        InputMode::None => ("", "", String::new()),
+        InputMode::ImportKey => {
+            let masked = "*".repeat(app.input_buffer.len());
+            (
+                "Add Wallet",
+                "Paste secret key and press Enter:".to_string(),
+                masked,
+            )
+        }
+        InputMode::AddWatchOnlyName => (
+            "Add Watch-Only",
+            "Enter a name for this wallet:".to_string(),
+            app.input_buffer.clone(),
+        ),
+        InputMode::AddWatchOnly => (
+            "Add Watch-Only",
+            "Paste the public address:".to_string(),
+            app.input_buffer.clone(),
+        ),
+        InputMode::RenameWallet => (
+            "Rename Wallet",
+            "Enter new name:".to_string(),
+            app.input_buffer.clone(),
+        ),
+        InputMode::ConfirmDeleteWallet => (
+            "Delete Wallet",
+            delete_prompt,
+            app.input_buffer.clone(),
+        ),
+        InputMode::SignMessage => (
+            "Sign Message",
+            "Enter message and press Enter:".to_string(),
+            app.input_buffer.clone(),
+        ),
+        InputMode::None => ("", String::new(), String::new()),
     };
 
     let content = Text::from(vec![
-        Line::from(prompt),
+        Line::from(prompt.as_str().to_string()),
         Line::from(""),
         Line::from(display),
         Line::from(""),
@@ -1171,6 +1486,11 @@ fn status_style(message: &str) -> Style {
         || lower.contains("signed")
         || lower.contains("set to")
         || lower.contains("live data")
+        || lower.contains("imported")
+        || lower.contains("added")
+        || lower.contains("switched")
+        || lower.contains("renamed")
+        || lower.contains("removed")
     {
         Style::default().fg(COLOR_MOSS)
     } else {
@@ -1233,19 +1553,165 @@ fn handle_cli() -> Result<bool, Box<dyn Error>> {
             "--import" => {
                 let secret =
                     std::env::var("DEN_SECRET_KEY").map_err(|_| "DEN_SECRET_KEY is not set")?;
-                store_secret(&secret)?;
-                println!(
-                    "Stored key in macOS Keychain for account '{}'.",
-                    KEYCHAIN_ACCOUNT
-                );
+                let keypair = keypair_from_secret(&secret)?;
+                let address = keypair.pubkey().to_string();
+                ensure_config_exists();
+                let mut config = load_den_config();
+                let wallet_id = next_wallet_id(&config);
+                store_secret_for_wallet(&wallet_id, &secret)?;
+                config.wallets.push(WalletEntry {
+                    id: wallet_id.clone(),
+                    name: "Imported".to_string(),
+                    address: address.clone(),
+                    has_key: true,
+                });
+                if config.active_wallet.is_none() {
+                    config.active_wallet = Some(wallet_id.clone());
+                }
+                save_den_config(&config)?;
+                println!("Key imported as '{}' ({}): {}", "Imported", wallet_id, short_address(&address));
+                return Ok(true);
+            }
+            "--add-wallet" => {
+                let name = args.next().ok_or("Usage: den --add-wallet <name>")?;
+                let secret =
+                    std::env::var("DEN_SECRET_KEY").map_err(|_| "DEN_SECRET_KEY is not set")?;
+                let keypair = keypair_from_secret(&secret)?;
+                let address = keypair.pubkey().to_string();
+                ensure_config_exists();
+                let mut config = load_den_config();
+                let wallet_id = next_wallet_id(&config);
+                store_secret_for_wallet(&wallet_id, &secret)?;
+                config.wallets.push(WalletEntry {
+                    id: wallet_id.clone(),
+                    name: name.clone(),
+                    address: address.clone(),
+                    has_key: true,
+                });
+                if config.active_wallet.is_none() {
+                    config.active_wallet = Some(wallet_id.clone());
+                }
+                save_den_config(&config)?;
+                println!("Added wallet '{}' ({}): {}", name, wallet_id, short_address(&address));
+                return Ok(true);
+            }
+            "--add-watch" => {
+                let name = args.next().ok_or("Usage: den --add-watch <name> <address>")?;
+                let address = args.next().ok_or("Usage: den --add-watch <name> <address>")?;
+                ensure_config_exists();
+                let mut config = load_den_config();
+                let wallet_id = next_wallet_id(&config);
+                config.wallets.push(WalletEntry {
+                    id: wallet_id.clone(),
+                    name: name.clone(),
+                    address: address.clone(),
+                    has_key: false,
+                });
+                if config.active_wallet.is_none() {
+                    config.active_wallet = Some(wallet_id.clone());
+                }
+                save_den_config(&config)?;
+                println!("Added watch-only '{}' ({}): {}", name, wallet_id, short_address(&address));
+                return Ok(true);
+            }
+            "--list-wallets" => {
+                ensure_config_exists();
+                let config = load_den_config();
+                if config.wallets.is_empty() {
+                    println!("No wallets configured.");
+                } else {
+                    let active = config.active_wallet.as_deref().unwrap_or("");
+                    for w in &config.wallets {
+                        let marker = if w.id == active { "*" } else { " " };
+                        let wtype = if w.has_key { "full" } else { "watch" };
+                        println!("{} {} ({}) [{}] {}", marker, w.name, w.id, wtype, short_address(&w.address));
+                    }
+                }
+                return Ok(true);
+            }
+            "--remove-wallet" => {
+                let target = args.next().ok_or("Usage: den --remove-wallet <name-or-id>")?;
+                ensure_config_exists();
+                let mut config = load_den_config();
+                let idx = config
+                    .wallets
+                    .iter()
+                    .position(|w| w.id == target || w.name == target)
+                    .ok_or(format!("Wallet '{}' not found", target))?;
+                let removed = config.wallets.remove(idx);
+                if removed.has_key {
+                    let _ = clear_secret_for_wallet(&removed.id);
+                }
+                if config.active_wallet.as_deref() == Some(&removed.id) {
+                    config.active_wallet = config.wallets.first().map(|w| w.id.clone());
+                }
+                save_den_config(&config)?;
+                println!("Removed wallet '{}' ({}).", removed.name, removed.id);
+                return Ok(true);
+            }
+            "--switch-wallet" => {
+                let target = args.next().ok_or("Usage: den --switch-wallet <name-or-id>")?;
+                ensure_config_exists();
+                let mut config = load_den_config();
+                let wallet = config
+                    .wallets
+                    .iter()
+                    .find(|w| w.id == target || w.name == target)
+                    .ok_or(format!("Wallet '{}' not found", target))?;
+                let wallet_id = wallet.id.clone();
+                let wallet_name = wallet.name.clone();
+                config.active_wallet = Some(wallet_id);
+                save_den_config(&config)?;
+                println!("Active wallet set to '{}'.", wallet_name);
+                return Ok(true);
+            }
+            "--rename-wallet" => {
+                let target = args.next().ok_or("Usage: den --rename-wallet <name-or-id> <new-name>")?;
+                let new_name = args.next().ok_or("Usage: den --rename-wallet <name-or-id> <new-name>")?;
+                ensure_config_exists();
+                let mut config = load_den_config();
+                let wallet = config
+                    .wallets
+                    .iter_mut()
+                    .find(|w| w.id == target || w.name == target)
+                    .ok_or(format!("Wallet '{}' not found", target))?;
+                wallet.name = new_name.clone();
+                save_den_config(&config)?;
+                println!("Wallet renamed to '{}'.", new_name);
                 return Ok(true);
             }
             "--clear" => {
-                clear_secret()?;
-                println!(
-                    "Removed key from macOS Keychain for account '{}'.",
-                    KEYCHAIN_ACCOUNT
-                );
+                ensure_config_exists();
+                let mut config = load_den_config();
+                let target = args.next();
+                let wallet_id = if let Some(t) = target {
+                    config
+                        .wallets
+                        .iter()
+                        .find(|w| w.id == t || w.name == t)
+                        .map(|w| w.id.clone())
+                } else {
+                    config.active_wallet.clone()
+                };
+                match wallet_id {
+                    Some(id) => {
+                        let wallet = config.wallets.iter().find(|w| w.id == id);
+                        match wallet {
+                            Some(w) if w.has_key => {
+                                let name = w.name.clone();
+                                clear_secret_for_wallet(&id)?;
+                                if let Some(entry) = config.wallets.iter_mut().find(|e| e.id == id) {
+                                    entry.has_key = false;
+                                }
+                                save_den_config(&config)?;
+                                println!("Key removed for wallet '{}'. Now watch-only.", name);
+                            }
+                            Some(w) => println!("Wallet '{}' is already watch-only.", w.name),
+                            None => println!("Wallet not found."),
+                        }
+                    }
+                    None => println!("No wallet found to clear."),
+                }
                 return Ok(true);
             }
             "--add-contact" => {
@@ -1286,9 +1752,7 @@ fn handle_cli() -> Result<bool, Box<dyn Error>> {
                 println!("  --remove-contact <name>       Remove a contact");
                 println!("  --list-contacts               List all contacts");
             "--set-api-key" => {
-                let key = args
-                    .next()
-                    .ok_or("Usage: den --set-api-key <KEY>")?;
+                let key = args.next().ok_or("Usage: den --set-api-key <KEY>")?;
                 store_api_key(&key)?;
                 println!("API key stored in Keychain.");
                 return Ok(true);
@@ -1299,9 +1763,7 @@ fn handle_cli() -> Result<bool, Box<dyn Error>> {
                 return Ok(true);
             }
             "--set-network" => {
-                let net = args
-                    .next()
-                    .ok_or("Usage: den --set-network <mainnet|devnet>")?;
+                let net = args.next().ok_or("Usage: den --set-network <mainnet|devnet>")?;
                 match net.as_str() {
                     "mainnet" | "devnet" => {
                         ensure_config_exists();
@@ -1323,34 +1785,51 @@ fn handle_cli() -> Result<bool, Box<dyn Error>> {
             }
             "--status" => {
                 ensure_config_exists();
+                let config = load_den_config();
                 println!("Den Wallet Status");
                 println!(
                     "  Config: {}",
                     config_path()
-                        .map(|p| {
-                            if p.exists() {
-                                format!("{}", p.display())
-                            } else {
-                                "not created yet".into()
-                            }
-                        })
-                        .unwrap_or_else(|| "unavailable".into())
+                        .map(|p| format!("{}", p.display()))
+                        .unwrap_or("unavailable".into())
                 );
-                println!("  {}", keychain_status());
-                println!("  {}", api_key_status());
-                let config = load_den_config();
                 println!("  Default network: {}", config.network.default);
+                println!("  {}", api_key_status());
+                println!("  Wallets: {}", config.wallets.len());
+                let active_name = active_wallet(&config)
+                    .map(|w| w.name.as_str())
+                    .unwrap_or("none");
+                println!("  Active: {}", active_name);
+                for w in &config.wallets {
+                    let marker = if config.active_wallet.as_deref() == Some(w.id.as_str()) {
+                        "*"
+                    } else {
+                        " "
+                    };
+                    let wtype = if w.has_key { "full" } else { "watch" };
+                    println!("    {} {} [{}] {}", marker, w.name, wtype, short_address(&w.address));
+                }
                 return Ok(true);
             }
             "--help" => {
                 println!("Den Wallet CLI");
-                println!("  --import           Store key from DEN_SECRET_KEY in Keychain");
-                println!("  --clear            Remove private key from Keychain");
-                println!("  --set-api-key KEY  Store Helius API key in Keychain");
-                println!("  --clear-api-key    Remove API key from Keychain");
-                println!("  --set-network NET  Set default network (mainnet|devnet)");
-                println!("  --config-path      Show config file location");
-                println!("  --status           Show current configuration status");
+                println!();
+                println!("Wallet Management:");
+                println!("  --add-wallet NAME       Import key from DEN_SECRET_KEY with name");
+                println!("  --add-watch NAME ADDR   Add a watch-only wallet");
+                println!("  --list-wallets          List all wallets");
+                println!("  --switch-wallet NAME    Set active wallet by name or ID");
+                println!("  --rename-wallet NAME NEW  Rename a wallet");
+                println!("  --remove-wallet NAME    Remove a wallet");
+                println!("  --import                Import key from DEN_SECRET_KEY (legacy)");
+                println!("  --clear [NAME]          Remove private key (active or named)");
+                println!();
+                println!("Configuration:");
+                println!("  --set-api-key KEY       Store Helius API key in Keychain");
+                println!("  --clear-api-key         Remove API key from Keychain");
+                println!("  --set-network NET       Set default network (mainnet|devnet)");
+                println!("  --config-path           Show config file location");
+                println!("  --status                Show full status");
                 return Ok(true);
             }
             _ => {}
@@ -1360,14 +1839,19 @@ fn handle_cli() -> Result<bool, Box<dyn Error>> {
     Ok(false)
 }
 
-fn store_secret(secret: &str) -> Result<(), Box<dyn Error>> {
-    let entry = keyring::Entry::new(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT)?;
+fn store_secret_for_wallet(wallet_id: &str, secret: &str) -> Result<(), Box<dyn Error>> {
+    let entry = keyring::Entry::new(KEYCHAIN_SERVICE, wallet_id)?;
     entry.set_password(secret)?;
     Ok(())
 }
 
-fn clear_secret() -> Result<(), Box<dyn Error>> {
-    let entry = keyring::Entry::new(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT)?;
+fn load_secret_for_wallet(wallet_id: &str) -> Result<String, Box<dyn Error>> {
+    let entry = keyring::Entry::new(KEYCHAIN_SERVICE, wallet_id)?;
+    Ok(entry.get_password()?)
+}
+
+fn clear_secret_for_wallet(wallet_id: &str) -> Result<(), Box<dyn Error>> {
+    let entry = keyring::Entry::new(KEYCHAIN_SERVICE, wallet_id)?;
     match entry.delete_password() {
         Ok(_) => Ok(()),
         Err(keyring::Error::NoEntry) => Ok(()),
@@ -1375,22 +1859,14 @@ fn clear_secret() -> Result<(), Box<dyn Error>> {
     }
 }
 
-fn keychain_status() -> String {
-    let entry = match keyring::Entry::new(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT) {
-        Ok(entry) => entry,
-        Err(_) => return "Keychain: unavailable".to_string(),
-    };
-
-    match entry.get_password() {
-        Ok(_) => "Keychain: stored".to_string(),
-        Err(keyring::Error::NoEntry) => "Keychain: empty".to_string(),
-        Err(_) => "Keychain: error".to_string(),
+fn keychain_status_summary(config: &DenConfig) -> String {
+    let with_keys = config.wallets.iter().filter(|w| w.has_key).count();
+    let watch_only = config.wallets.iter().filter(|w| !w.has_key).count();
+    if with_keys == 0 && watch_only == 0 {
+        "Keychain: no wallets".to_string()
+    } else {
+        format!("Keychain: {} keys, {} watch-only", with_keys, watch_only)
     }
-}
-
-fn load_secret() -> Result<String, Box<dyn Error>> {
-    let entry = keyring::Entry::new(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT)?;
-    Ok(entry.get_password()?)
 }
 
 fn store_api_key(api_key: &str) -> Result<(), Box<dyn Error>> {
@@ -1448,64 +1924,113 @@ fn keypair_from_bytes(bytes: &[u8]) -> Result<Keypair, Box<dyn Error>> {
     }
 }
 
-fn sign_message(message: &str) -> Result<String, Box<dyn Error>> {
-    let secret = load_secret()?;
+fn sign_message_with_wallet(wallet_id: &str, message: &str) -> Result<String, Box<dyn Error>> {
+    let secret = load_secret_for_wallet(wallet_id)?;
     let keypair = keypair_from_secret(&secret)?;
     let signature = keypair.sign_message(message.as_bytes());
     Ok(signature.to_string())
 }
 
-fn derive_address_from_keychain() -> Result<String, String> {
-    let secret = load_secret().map_err(|err| format!("Keychain error: {}", err))?;
-    let keypair = keypair_from_secret(&secret).map_err(|err| format!("Bad key: {}", err))?;
-    Ok(keypair.pubkey().to_string())
+fn resolve_api_key() -> Option<String> {
+    std::env::var("HELIUS_API_KEY")
+        .ok()
+        .or_else(|| load_api_key().ok())
 }
 
-fn refresh_wallet_data(app: &mut App) {
-    app.keystore_status = keychain_status();
-    app.api_key_status = api_key_status();
-    match Config::load(app.network) {
-        Ok(config) => {
-            app.wallet_address = short_address(&config.address);
-            match fetch_wallet_data(&config) {
-                Ok(data) => app.apply_data(&config.address, data),
-                Err(err) => app.status = format!("Helius error: {}", err),
-            }
-        }
-        Err(message) => app.status = message,
+fn build_rpc_url(api_key: &str, network: Network) -> String {
+    match network {
+        Network::Mainnet => format!("https://rpc.helius.xyz/?api-key={}", api_key),
+        Network::Devnet => format!("https://rpc-devnet.helius.xyz/?api-key={}", api_key),
     }
 }
 
-impl Config {
-    fn load(network: Network) -> Result<Self, String> {
-        let den_config = load_den_config();
+fn fetch_sol_balance(
+    client: &reqwest::blocking::Client,
+    rpc_url: &str,
+    address: &str,
+) -> Result<f64, Box<dyn Error>> {
+    let result = rpc_call(client, rpc_url, "getBalance", json!([address]))?;
+    let lamports = result
+        .get("value")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    Ok(lamports as f64 / 1_000_000_000.0)
+}
 
-        // API key: env > keychain
-        let api_key = std::env::var("HELIUS_API_KEY")
-            .ok()
-            .or_else(|| load_api_key().ok())
-            .ok_or_else(|| "No API key. Run: den --set-api-key <key>".to_string())?;
+fn refresh_wallet_data(app: &mut App) {
+    let den_config = load_den_config();
+    app.keystore_status = keychain_status_summary(&den_config);
+    app.api_key_status = api_key_status();
 
-        // Address: env > config file > keychain-derived
-        let address = std::env::var("WALLET_ADDRESS")
-            .ok()
-            .or_else(|| {
-                let addr = den_config.wallet.address.clone();
-                if addr.is_empty() { None } else { Some(addr) }
-            })
-            .or_else(|| derive_address_from_keychain().ok())
-            .ok_or_else(|| "No wallet address. Import a key (i) or run: den --import".to_string())?;
+    let api_key = match resolve_api_key() {
+        Some(key) => key,
+        None => {
+            app.status = "No API key. Run: den --set-api-key <key>".to_string();
+            // Still populate accounts from config without balances
+            app.accounts = den_config
+                .wallets
+                .iter()
+                .map(|w| Account {
+                    id: w.id.clone(),
+                    name: w.name.clone(),
+                    address: w.address.clone(),
+                    balance: "-.-- SOL".to_string(),
+                    has_key: w.has_key,
+                    is_active: den_config.active_wallet.as_deref() == Some(w.id.as_str()),
+                })
+                .collect();
+            return;
+        }
+    };
 
-        let rpc_url = match network {
-            Network::Mainnet => format!("https://rpc.helius.xyz/?api-key={}", api_key),
-            Network::Devnet => format!("https://rpc-devnet.helius.xyz/?api-key={}", api_key),
-        };
+    let rpc_url = build_rpc_url(&api_key, app.network);
+    let client = reqwest::blocking::Client::new();
 
-        Ok(Self {
+    // Build accounts list, fetching SOL balance for each
+    let mut accounts: Vec<Account> = Vec::new();
+    for wallet in &den_config.wallets {
+        let is_active = den_config.active_wallet.as_deref() == Some(wallet.id.as_str());
+        let balance = fetch_sol_balance(&client, &rpc_url, &wallet.address)
+            .map(|b| format!("{:.4} SOL", b))
+            .unwrap_or_else(|_| "?.?? SOL".to_string());
+
+        accounts.push(Account {
+            id: wallet.id.clone(),
+            name: wallet.name.clone(),
+            address: wallet.address.clone(),
+            balance,
+            has_key: wallet.has_key,
+            is_active,
+        });
+    }
+    app.accounts = accounts;
+
+    // Full fetch for active wallet only
+    if let Some(active) = active_wallet(&den_config) {
+        let config = Config {
             api_key,
-            address,
+            address: active.address.clone(),
             rpc_url,
-        })
+        };
+        app.active_wallet_id = Some(active.id.clone());
+        app.wallet_address = short_address(&active.address);
+
+        match fetch_wallet_data(&config) {
+            Ok(data) => {
+                app.total_balance = format!("{:.4} SOL", data.sol_balance);
+                // Update active account balance with precise DAS value
+                if let Some(acc) = app.accounts.iter_mut().find(|a| a.is_active) {
+                    acc.balance = app.total_balance.clone();
+                }
+                app.apply_active_data(data);
+            }
+            Err(err) => app.status = format!("Helius error: {}", err),
+        }
+    } else if den_config.wallets.is_empty() {
+        app.status = "No wallets. Press 'a' on Accounts tab to add one".to_string();
+        app.wallet_address = "Unset".to_string();
+    } else {
+        app.status = "No active wallet selected".to_string();
     }
 }
 
