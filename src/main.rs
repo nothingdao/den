@@ -1,7 +1,7 @@
 use std::error::Error;
-use std::fs;
-use std::io;
-use std::path::{Path, PathBuf};
+use std::io::{self, Write};
+use std::process::{Command, Stdio};
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
@@ -18,17 +18,25 @@ use ratatui::widgets::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use chrono::Utc;
 use solana_sdk::signature::{Keypair, Signer};
 
 const KEYCHAIN_SERVICE: &str = "den-wallet";
 const KEYCHAIN_API_KEY_ACCOUNT: &str = "helius-api-key";
 const CONFIG_DIR_NAME: &str = "den";
 const CONFIG_FILE_NAME: &str = "config.toml";
+const CONFIG_CACHE_FILE_NAME: &str = "config-cache.json";
+const BOOTSTRAP_FILE_NAME: &str = "bootstrap.json";
+const CONTACTS_FILE_NAME: &str = "contacts.json";
+const CONFIG_BACKEND_ENV: &str = "DEN_CONFIG_BACKEND";
+const BW_CONFIG_ITEM_ID_ENV: &str = "DEN_BW_CONFIG_ITEM_ID";
+
+static CONFIG_REV: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+static BW_SESSION_CACHE: OnceLock<Mutex<Option<String>>> = OnceLock::new();
 
 const COLOR_BARK: Color = Color::Rgb(58, 46, 42);
 const COLOR_FAWN: Color = Color::Rgb(199, 181, 154);
 const COLOR_ASH: Color = Color::Rgb(232, 225, 215);
-const COLOR_PINE: Color = Color::Rgb(30, 43, 38);
 const COLOR_SOOT: Color = Color::Rgb(16, 16, 16);
 const COLOR_STONE: Color = Color::Rgb(118, 111, 102);
 const COLOR_MOSS: Color = Color::Rgb(78, 104, 82);
@@ -90,6 +98,7 @@ struct Account {
     balance: String,
     has_key: bool,
     is_active: bool,
+    added_at: Option<String>,
 }
 
 struct Transaction {
@@ -102,6 +111,26 @@ struct Transaction {
 struct Contact {
     name: String,
     address: String,
+    #[serde(default = "default_contact_network")]
+    network: String,
+    #[serde(default)]
+    notes: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Default)]
+struct ContactsFile {
+    #[serde(default = "default_contacts_version")]
+    version: u32,
+    #[serde(default)]
+    contacts: Vec<Contact>,
+}
+
+fn default_contact_network() -> String {
+    "mainnet".to_string()
+}
+
+fn default_contacts_version() -> u32 {
+    1
 }
 
 struct WalletData {
@@ -111,15 +140,8 @@ struct WalletData {
 }
 
 struct Config {
-    api_key: String,
     address: String,
     rpc_url: String,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-struct ContactsConfig {
-    version: u32,
-    contacts: Vec<Contact>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -144,7 +166,7 @@ impl Network {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 struct DenConfig {
     #[serde(default)]
     network: NetworkConfig,
@@ -177,29 +199,34 @@ struct WalletEntry {
     address: String,
     #[serde(default)]
     has_key: bool,
+    #[serde(default)]
+    added_at: Option<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 struct LegacyWalletConfig {
     #[serde(default)]
     address: String,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 struct NetworkConfig {
     #[serde(default = "default_network")]
     default: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    api_key: Option<String>,
 }
 
 impl Default for NetworkConfig {
     fn default() -> Self {
         Self {
             default: default_network(),
+            api_key: None,
         }
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 struct DisplayConfig {
     #[serde(default = "default_theme")]
     theme: String,
@@ -221,26 +248,469 @@ fn default_theme() -> String {
     "den".to_string()
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct ConfigEnvelope {
+    config: DenConfig,
+    rev: String,
+    updated_at: String,
+    updated_by: String,
+}
+
+impl ConfigEnvelope {
+    fn from_config(config: DenConfig) -> Self {
+        Self {
+            config,
+            rev: new_config_rev(),
+            updated_at: Utc::now().to_rfc3339(),
+            updated_by: std::env::var("HOSTNAME")
+                .or_else(|_| std::env::var("USER"))
+                .unwrap_or_else(|_| "unknown".to_string()),
+        }
+    }
+}
+
+trait ConfigStore {
+    fn load(&self) -> Result<ConfigEnvelope, Box<dyn Error>>;
+    fn save(
+        &self,
+        config: &DenConfig,
+        expected_rev: Option<&str>,
+    ) -> Result<ConfigEnvelope, Box<dyn Error>>;
+    fn location(&self) -> String;
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ConfigBackend {
+    Local,
+    Bitwarden,
+}
+
+struct LocalConfigStore;
+
+struct BitwardenConfigStore {
+    item_id: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+struct BootstrapConfig {
+    #[serde(default)]
+    backend: Option<String>,
+    #[serde(default)]
+    bitwarden_item_id: Option<String>,
+    #[serde(default)]
+    onboarding_complete: bool,
+}
+
 fn config_path() -> Option<std::path::PathBuf> {
     dirs::config_dir().map(|dir| dir.join(CONFIG_DIR_NAME).join(CONFIG_FILE_NAME))
 }
 
-fn load_den_config() -> DenConfig {
-    let path = match config_path() {
+fn bootstrap_path() -> Option<std::path::PathBuf> {
+    dirs::config_dir().map(|dir| dir.join(CONFIG_DIR_NAME).join(BOOTSTRAP_FILE_NAME))
+}
+
+fn config_cache_path() -> Option<std::path::PathBuf> {
+    dirs::config_dir().map(|dir| dir.join(CONFIG_DIR_NAME).join(CONFIG_CACHE_FILE_NAME))
+}
+
+fn load_bootstrap_config() -> BootstrapConfig {
+    let path = match bootstrap_path() {
         Some(path) => path,
-        None => return DenConfig::default(),
+        None => return BootstrapConfig::default(),
     };
 
-    let mut config: DenConfig = match std::fs::read_to_string(&path) {
-        Ok(contents) => toml::from_str(&contents).unwrap_or_default(),
-        Err(_) => DenConfig::default(),
-    };
+    match std::fs::read_to_string(path) {
+        Ok(contents) => serde_json::from_str(&contents).unwrap_or_default(),
+        Err(_) => BootstrapConfig::default(),
+    }
+}
 
-    if migrate_config_if_needed(&mut config) {
-        let _ = save_den_config(&config);
+fn save_bootstrap_config(config: &BootstrapConfig) -> Result<(), Box<dyn Error>> {
+    let path = bootstrap_path().ok_or("Cannot determine config directory")?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let contents = serde_json::to_string_pretty(config)?;
+    std::fs::write(path, contents)?;
+    Ok(())
+}
+
+fn should_start_onboarding() -> bool {
+    if std::env::var(CONFIG_BACKEND_ENV).is_ok() || std::env::var(BW_CONFIG_ITEM_ID_ENV).is_ok() {
+        return false;
+    }
+    let bootstrap = load_bootstrap_config();
+    !bootstrap.onboarding_complete
+}
+
+fn current_config_backend() -> ConfigBackend {
+    if let Ok(value) = std::env::var(CONFIG_BACKEND_ENV) {
+        return match value.to_ascii_lowercase().as_str() {
+            "bitwarden" | "bw" => ConfigBackend::Bitwarden,
+            _ => ConfigBackend::Local,
+        };
     }
 
-    config
+    let bootstrap = load_bootstrap_config();
+    if let Some(value) = bootstrap.backend {
+        return match value.to_ascii_lowercase().as_str() {
+            "bitwarden" | "bw" => ConfigBackend::Bitwarden,
+            _ => ConfigBackend::Local,
+        };
+    }
+
+    ConfigBackend::Local
+}
+
+fn resolve_bitwarden_item_id() -> Option<String> {
+    if let Ok(item_id) = std::env::var(BW_CONFIG_ITEM_ID_ENV) {
+        if !item_id.trim().is_empty() {
+            return Some(item_id);
+        }
+    }
+
+    let bootstrap = load_bootstrap_config();
+    bootstrap.bitwarden_item_id.filter(|id| !id.trim().is_empty())
+}
+
+fn selected_config_store() -> Result<Box<dyn ConfigStore>, Box<dyn Error>> {
+    match current_config_backend() {
+        ConfigBackend::Local => Ok(Box::new(LocalConfigStore)),
+        ConfigBackend::Bitwarden => {
+            let item_id = resolve_bitwarden_item_id()
+                .ok_or(format!("{} is not set", BW_CONFIG_ITEM_ID_ENV))?;
+            Ok(Box::new(BitwardenConfigStore { item_id }))
+        }
+    }
+}
+
+fn config_rev_cell() -> &'static Mutex<Option<String>> {
+    CONFIG_REV.get_or_init(|| Mutex::new(None))
+}
+
+fn bw_session_cell() -> &'static Mutex<Option<String>> {
+    BW_SESSION_CACHE.get_or_init(|| Mutex::new(None))
+}
+
+fn set_cached_bw_session(session: Option<String>) {
+    if let Ok(mut guard) = bw_session_cell().lock() {
+        *guard = session;
+    }
+}
+
+fn cached_bw_session() -> Option<String> {
+    bw_session_cell().lock().ok().and_then(|g| g.clone())
+}
+
+fn set_cached_config_rev(rev: Option<String>) {
+    if let Ok(mut guard) = config_rev_cell().lock() {
+        *guard = rev;
+    }
+}
+
+fn cached_config_rev() -> Option<String> {
+    config_rev_cell().lock().ok().and_then(|g| g.clone())
+}
+
+fn new_config_rev() -> String {
+    let nanos = Utc::now()
+        .timestamp_nanos_opt()
+        .unwrap_or(Utc::now().timestamp_micros() * 1_000);
+    format!("rev-{}-{}", nanos, std::process::id())
+}
+
+fn load_cached_config_envelope() -> Option<ConfigEnvelope> {
+    let path = config_cache_path()?;
+    let contents = std::fs::read_to_string(path).ok()?;
+    serde_json::from_str(&contents).ok()
+}
+
+fn save_cached_config_envelope(envelope: &ConfigEnvelope) {
+    let Some(path) = config_cache_path() else {
+        return;
+    };
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Ok(contents) = serde_json::to_string_pretty(envelope) {
+        let _ = std::fs::write(path, contents);
+    }
+}
+
+fn parse_config_envelope(raw: &str) -> Result<ConfigEnvelope, Box<dyn Error>> {
+    if raw.trim().is_empty() {
+        return Err("Empty config payload".into());
+    }
+
+    if let Ok(envelope) = serde_json::from_str::<ConfigEnvelope>(raw) {
+        return Ok(envelope);
+    }
+
+    if let Ok(config) = toml::from_str::<DenConfig>(raw) {
+        return Ok(ConfigEnvelope::from_config(config));
+    }
+
+    let config = serde_json::from_str::<DenConfig>(raw)?;
+    Ok(ConfigEnvelope::from_config(config))
+}
+
+fn run_command_with_input_and_env(
+    cmd: &str,
+    args: &[&str],
+    input: Option<&str>,
+    env_vars: &[(&str, &str)],
+) -> Result<String, Box<dyn Error>> {
+    let mut command = Command::new(cmd);
+    command.args(args);
+    if cmd == "bw" {
+        if let Some(session) = cached_bw_session() {
+            if !session.trim().is_empty() {
+                command.env("BW_SESSION", session);
+            }
+        }
+    }
+    for (key, value) in env_vars {
+        command.env(key, value);
+    }
+    if input.is_some() {
+        command.stdin(Stdio::piped());
+    }
+    let mut child = command.stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
+
+    if let Some(payload) = input {
+        if let Some(mut stdin) = child.stdin.take() {
+            stdin.write_all(payload.as_bytes())?;
+        }
+    }
+
+    let output = child.wait_with_output()?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let detail = if !stderr.is_empty() { stderr } else { stdout };
+        let message = if detail.is_empty() {
+            format!("Command '{}' failed", cmd)
+        } else {
+            format!("Command '{}' failed: {}", cmd, detail)
+        };
+        return Err(message.into());
+    }
+
+    Ok(String::from_utf8(output.stdout)?)
+}
+
+fn run_command_with_input(
+    cmd: &str,
+    args: &[&str],
+    input: Option<&str>,
+) -> Result<String, Box<dyn Error>> {
+    run_command_with_input_and_env(cmd, args, input, &[])
+}
+
+fn bw_encode(payload: &str) -> Result<String, Box<dyn Error>> {
+    let encoded = run_command_with_input("bw", &["encode"], Some(payload))?;
+    Ok(encoded.trim().to_string())
+}
+
+fn bw_get_item_json(item_id: &str) -> Result<serde_json::Value, Box<dyn Error>> {
+    let output = run_command_with_input("bw", &["get", "item", item_id], None)?;
+    Ok(serde_json::from_str(&output)?)
+}
+
+fn bw_edit_item_partial(item_id: &str, payload: &serde_json::Value) -> Result<(), Box<dyn Error>> {
+    let payload_json = serde_json::to_string(payload)?;
+    let encoded = bw_encode(&payload_json)?;
+    let _ = run_command_with_input("bw", &["edit", "item", item_id, &encoded], None)?;
+    Ok(())
+}
+
+fn bw_status() -> Result<String, Box<dyn Error>> {
+    let output = run_command_with_input("bw", &["status", "--raw"], None)?;
+    let parsed: serde_json::Value = serde_json::from_str(&output)?;
+    let status = parsed
+        .get("status")
+        .and_then(|v| v.as_str())
+        .ok_or("Unable to determine Bitwarden status")?;
+    Ok(status.to_string())
+}
+
+fn bw_login_with_apikey(client_id: &str, client_secret: &str) -> Result<(), Box<dyn Error>> {
+    let _ = run_command_with_input_and_env(
+        "bw",
+        &["login", "--apikey"],
+        None,
+        &[("BW_CLIENTID", client_id), ("BW_CLIENTSECRET", client_secret)],
+    )?;
+    Ok(())
+}
+
+fn bw_unlock_with_password(password: &str) -> Result<String, Box<dyn Error>> {
+    let session = run_command_with_input_and_env(
+        "bw",
+        &["unlock", "--raw", "--passwordenv", "BW_PASSWORD"],
+        None,
+        &[("BW_PASSWORD", password)],
+    )?;
+    let token = session.trim().to_string();
+    if token.is_empty() {
+        return Err("Bitwarden unlock did not return a session token".into());
+    }
+    Ok(token)
+}
+
+impl ConfigStore for LocalConfigStore {
+    fn load(&self) -> Result<ConfigEnvelope, Box<dyn Error>> {
+        let path = config_path().ok_or("Cannot determine config directory")?;
+        let config: DenConfig = match std::fs::read_to_string(path) {
+            Ok(contents) => toml::from_str(&contents).unwrap_or_default(),
+            Err(_) => DenConfig::default(),
+        };
+        Ok(ConfigEnvelope::from_config(config))
+    }
+
+    fn save(
+        &self,
+        config: &DenConfig,
+        _expected_rev: Option<&str>,
+    ) -> Result<ConfigEnvelope, Box<dyn Error>> {
+        let path = config_path().ok_or("Cannot determine config directory")?;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let contents = toml::to_string_pretty(config)?;
+        std::fs::write(&path, contents)?;
+        Ok(ConfigEnvelope::from_config(config.clone()))
+    }
+
+    fn location(&self) -> String {
+        config_path()
+            .map(|p| format!("{}", p.display()))
+            .unwrap_or_else(|| "unavailable".to_string())
+    }
+}
+
+impl ConfigStore for BitwardenConfigStore {
+    fn load(&self) -> Result<ConfigEnvelope, Box<dyn Error>> {
+        let item = bw_get_item_json(&self.item_id)?;
+        let notes = item
+            .get("notes")
+            .and_then(|n| n.as_str())
+            .ok_or("Bitwarden config item is missing notes")?;
+        parse_config_envelope(notes)
+    }
+
+    fn save(
+        &self,
+        config: &DenConfig,
+        expected_rev: Option<&str>,
+    ) -> Result<ConfigEnvelope, Box<dyn Error>> {
+        let current = self.load().ok();
+        if let (Some(expected), Some(existing)) = (expected_rev, current.as_ref()) {
+            if existing.rev != expected {
+                return Err(format!(
+                    "Config conflict: expected rev {}, found {}",
+                    expected, existing.rev
+                )
+                .into());
+            }
+        }
+
+        let envelope = ConfigEnvelope::from_config(config.clone());
+        let notes = serde_json::to_string_pretty(&envelope)?;
+        let payload = json!({ "notes": notes });
+        bw_edit_item_partial(&self.item_id, &payload)?;
+        Ok(envelope)
+    }
+
+    fn location(&self) -> String {
+        format!("bitwarden:{}", self.item_id)
+    }
+}
+
+fn config_location_display() -> String {
+    selected_config_store()
+        .map(|store| store.location())
+        .unwrap_or_else(|_| "unavailable".to_string())
+}
+
+fn persist_backend_choice(backend: ConfigBackend, bitwarden_item_id: Option<String>) -> Result<(), Box<dyn Error>> {
+    let mut bootstrap = load_bootstrap_config();
+    bootstrap.backend = Some(match backend {
+        ConfigBackend::Local => "local".to_string(),
+        ConfigBackend::Bitwarden => "bitwarden".to_string(),
+    });
+    bootstrap.bitwarden_item_id = bitwarden_item_id;
+    bootstrap.onboarding_complete = true;
+    save_bootstrap_config(&bootstrap)
+}
+
+fn initialize_bitwarden_config_item(item_id: &str) -> Result<(), Box<dyn Error>> {
+    let item = bw_get_item_json(item_id)?;
+    let notes = item
+        .get("notes")
+        .and_then(|n| n.as_str())
+        .unwrap_or("");
+
+    if parse_config_envelope(notes).is_ok() {
+        return Ok(());
+    }
+
+    let envelope = ConfigEnvelope::from_config(DenConfig::default());
+    let payload = json!({
+        "notes": serde_json::to_string_pretty(&envelope)?
+    });
+    bw_edit_item_partial(item_id, &payload)?;
+    Ok(())
+}
+
+fn migrate_local_config_to_bitwarden(force: bool) -> Result<String, Box<dyn Error>> {
+    let item_id = std::env::var(BW_CONFIG_ITEM_ID_ENV)
+        .map_err(|_| format!("{} is not set", BW_CONFIG_ITEM_ID_ENV))?;
+    let local_store = LocalConfigStore;
+    let bitwarden_store = BitwardenConfigStore { item_id };
+
+    if !force && bitwarden_store.load().is_ok() {
+        return Err(
+            "Bitwarden config already exists. Re-run with --migrate-config-to-bitwarden --force"
+                .into(),
+        );
+    }
+
+    let local = local_store.load()?.config;
+    let saved = bitwarden_store.save(&local, None)?;
+    persist_backend_choice(
+        ConfigBackend::Bitwarden,
+        Some(bitwarden_store.item_id.clone()),
+    )?;
+    set_cached_config_rev(Some(saved.rev.clone()));
+    save_cached_config_envelope(&saved);
+    Ok(bitwarden_store.location())
+}
+
+fn load_den_config() -> DenConfig {
+    let store = match selected_config_store() {
+        Ok(store) => store,
+        Err(_) => return DenConfig::default(),
+    };
+
+    let mut envelope = match store.load() {
+        Ok(envelope) => {
+            save_cached_config_envelope(&envelope);
+            envelope
+        }
+        Err(_) => match load_cached_config_envelope() {
+            Some(cached) => cached,
+            None => ConfigEnvelope::from_config(DenConfig::default()),
+        },
+    };
+
+    set_cached_config_rev(Some(envelope.rev.clone()));
+
+    if migrate_config_if_needed(&mut envelope.config) {
+        let _ = save_den_config(&envelope.config);
+    }
+
+    envelope.config
 }
 
 fn migrate_config_if_needed(config: &mut DenConfig) -> bool {
@@ -286,6 +756,7 @@ fn migrate_config_if_needed(config: &mut DenConfig) -> bool {
         name: "Main".to_string(),
         address,
         has_key,
+        added_at: None,
     });
     config.active_wallet = Some(wallet_id);
 
@@ -318,21 +789,48 @@ fn set_active_wallet(config: &mut DenConfig, wallet_id: &str) {
 }
 
 fn save_den_config(config: &DenConfig) -> Result<(), Box<dyn Error>> {
-    let path = config_path().ok_or("Cannot determine config directory")?;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let contents = toml::to_string_pretty(config)?;
-    std::fs::write(&path, contents)?;
+    let store = selected_config_store()?;
+    let expected = cached_config_rev();
+    let envelope = store.save(config, expected.as_deref())?;
+    set_cached_config_rev(Some(envelope.rev.clone()));
+    save_cached_config_envelope(&envelope);
     Ok(())
 }
 
 fn ensure_config_exists() {
-    if let Some(path) = config_path() {
-        if !path.exists() {
-            let _ = save_den_config(&DenConfig::default());
+    if current_config_backend() == ConfigBackend::Local {
+        if let Some(path) = config_path() {
+            if !path.exists() {
+                let _ = save_den_config(&DenConfig::default());
+            }
         }
     }
+}
+
+fn contacts_path() -> Option<std::path::PathBuf> {
+    dirs::config_dir().map(|dir| dir.join(CONFIG_DIR_NAME).join(CONTACTS_FILE_NAME))
+}
+
+fn load_contacts() -> ContactsFile {
+    let path = match contacts_path() {
+        Some(path) => path,
+        None => return ContactsFile::default(),
+    };
+
+    match std::fs::read_to_string(&path) {
+        Ok(contents) => serde_json::from_str(&contents).unwrap_or_default(),
+        Err(_) => ContactsFile::default(),
+    }
+}
+
+fn save_contacts(file: &ContactsFile) -> Result<(), Box<dyn Error>> {
+    let path = contacts_path().ok_or("Cannot determine config directory")?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let contents = serde_json::to_string_pretty(file)?;
+    std::fs::write(&path, contents)?;
+    Ok(())
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -345,6 +843,30 @@ enum InputMode {
     RenameWallet,
     ConfirmDeleteWallet,
     SignMessage,
+    AddContactName,
+    AddContactAddress,
+    EditContactName,
+    EditContactAddress,
+    EditContactNotes,
+    ConfirmDeleteContact,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OnboardingStep {
+    ChooseBackend,
+    BitwardenAuth,
+    BitwardenApiKeyId,
+    BitwardenApiKeySecret,
+    BitwardenMasterPassword,
+    BitwardenItemId,
+}
+
+struct OnboardingState {
+    active: bool,
+    step: OnboardingStep,
+    input: String,
+    message: String,
+    bw_client_id: String,
 }
 
 struct ImportState {
@@ -374,13 +896,14 @@ struct App {
     input_mode: InputMode,
     input_buffer: String,
     import_state: ImportState,
+    wallet_detail_index: Option<usize>,
+    contact_detail_index: Option<usize>,
     last_signature: String,
+    onboarding: OnboardingState,
 }
 
 impl App {
     fn new_placeholder() -> Self {
-        let contacts = load_contacts().unwrap_or_else(|_| default_contacts());
-        
         Self {
             should_quit: false,
             tab: Tab::Overview,
@@ -396,7 +919,7 @@ impl App {
                 summary: "No transactions".to_string(),
                 amount: "".to_string(),
             }],
-            contacts,
+            contacts: Vec::new(),
             selected_account: 0,
             selected_token: 0,
             selected_history: 0,
@@ -408,16 +931,23 @@ impl App {
             keystore_status: "Keychain: no wallets".to_string(),
             api_key_status: "API Key: not set".to_string(),
             default_network: "mainnet".to_string(),
-            config_path_display: config_path()
-                .map(|p| format!("{}", p.display()))
-                .unwrap_or_else(|| "unavailable".to_string()),
+            config_path_display: config_location_display(),
             network: Network::Mainnet,
             input_mode: InputMode::None,
             input_buffer: String::new(),
             import_state: ImportState {
                 wallet_name: String::new(),
             },
+            wallet_detail_index: None,
+            contact_detail_index: None,
             last_signature: "-".to_string(),
+            onboarding: OnboardingState {
+                active: false,
+                step: OnboardingStep::ChooseBackend,
+                input: String::new(),
+                message: String::new(),
+                bw_client_id: String::new(),
+            },
         }
     }
 
@@ -437,6 +967,11 @@ impl App {
     }
 
     fn on_key(&mut self, code: KeyCode) {
+        if self.onboarding.active {
+            self.handle_onboarding_mode(code);
+            return;
+        }
+
         if self.input_mode != InputMode::None {
             self.handle_input_mode(code);
             return;
@@ -456,16 +991,37 @@ impl App {
             KeyCode::Down => self.move_selection(1),
             KeyCode::Char('n') => {
                 self.network = self.network.toggle();
-                self.status = format!("Network set to {}", self.network.label());
+                let msg = format!("Network set to {}", self.network.label());
                 refresh_wallet_data(self);
+                self.status = msg;
             }
             KeyCode::Char('r') => {
                 refresh_wallet_data(self);
             }
-            KeyCode::Char('i') | KeyCode::Char('a') => {
+            KeyCode::Char('i') => {
                 self.input_mode = InputMode::ImportKeyName;
                 self.input_buffer.clear();
                 self.import_state.wallet_name.clear();
+            }
+            KeyCode::Char('a') => {
+                if self.tab == Tab::AddressBook {
+                    if self.contact_detail_index.is_some() {
+                        if let Some(idx) = self.contact_detail_index {
+                            if idx < self.contacts.len() {
+                                self.input_mode = InputMode::EditContactAddress;
+                                self.input_buffer = self.contacts[idx].address.clone();
+                            }
+                        }
+                    } else {
+                        self.input_mode = InputMode::AddContactName;
+                        self.input_buffer.clear();
+                        self.import_state.wallet_name.clear();
+                    }
+                } else {
+                    self.input_mode = InputMode::ImportKeyName;
+                    self.input_buffer.clear();
+                    self.import_state.wallet_name.clear();
+                }
             }
             KeyCode::Char('w') => {
                 if self.tab == Tab::Accounts {
@@ -478,24 +1034,62 @@ impl App {
                 if self.tab == Tab::Accounts && !self.accounts.is_empty() {
                     self.input_mode = InputMode::RenameWallet;
                     self.input_buffer = self.accounts[self.selected_account].name.clone();
+                } else if self.tab == Tab::AddressBook && !self.contacts.is_empty() {
+                    let idx = self.contact_detail_index.unwrap_or(self.selected_contact);
+                    if idx < self.contacts.len() {
+                        self.input_mode = InputMode::EditContactName;
+                        self.input_buffer = self.contacts[idx].name.clone();
+                    }
                 }
             }
             KeyCode::Char('d') => {
                 if self.tab == Tab::Accounts && !self.accounts.is_empty() {
                     self.input_mode = InputMode::ConfirmDeleteWallet;
                     self.input_buffer.clear();
+                } else if self.tab == Tab::AddressBook && !self.contacts.is_empty() {
+                    self.input_mode = InputMode::ConfirmDeleteContact;
+                    self.input_buffer.clear();
                 }
             }
             KeyCode::Enter => {
                 if self.tab == Tab::Accounts && !self.accounts.is_empty() {
-                    let selected = &self.accounts[self.selected_account];
-                    let wallet_id = selected.id.clone();
-                    let wallet_name = selected.name.clone();
-                    let mut config = load_den_config();
-                    set_active_wallet(&mut config, &wallet_id);
-                    let _ = save_den_config(&config);
-                    self.status = format!("Switched to '{}'", wallet_name);
-                    refresh_wallet_data(self);
+                    if self.wallet_detail_index.is_some() {
+                        let selected = &self.accounts[self.selected_account];
+                        let wallet_id = selected.id.clone();
+                        let wallet_name = selected.name.clone();
+                        let mut config = load_den_config();
+                        set_active_wallet(&mut config, &wallet_id);
+                        let _ = save_den_config(&config);
+                        let msg = format!("Switched to '{}'", wallet_name);
+                        refresh_wallet_data(self);
+                        self.status = msg;
+                    } else {
+                        self.wallet_detail_index = Some(self.selected_account);
+                    }
+                } else if self.tab == Tab::AddressBook
+                    && self.contact_detail_index.is_none()
+                    && !self.contacts.is_empty()
+                {
+                    self.contact_detail_index = Some(self.selected_contact);
+                }
+            }
+            KeyCode::Esc => {
+                if self.tab == Tab::Accounts && self.wallet_detail_index.is_some() {
+                    self.wallet_detail_index = None;
+                } else if self.tab == Tab::AddressBook && self.contact_detail_index.is_some() {
+                    self.contact_detail_index = None;
+                }
+            }
+            KeyCode::Char('o') => {
+                if self.tab == Tab::AddressBook {
+                    if let Some(idx) = self.contact_detail_index {
+                        if idx < self.contacts.len() {
+                            self.input_mode = InputMode::EditContactNotes;
+                            self.input_buffer = self.contacts[idx].notes.clone();
+                        }
+                    }
+                } else if self.tab == Tab::Settings {
+                    self.start_onboarding();
                 }
             }
             KeyCode::Char('s') => {
@@ -514,6 +1108,217 @@ impl App {
                 }
             }
             _ => {}
+        }
+    }
+
+    fn start_onboarding(&mut self) {
+        self.onboarding.active = true;
+        self.onboarding.step = OnboardingStep::ChooseBackend;
+        self.onboarding.input.clear();
+        self.onboarding.bw_client_id.clear();
+        self.onboarding.message = "Choose where config should live.".to_string();
+        self.tab = Tab::Settings;
+    }
+
+    fn complete_onboarding(&mut self, status: &str) {
+        self.onboarding.active = false;
+        self.onboarding.step = OnboardingStep::ChooseBackend;
+        self.onboarding.input.clear();
+        self.onboarding.bw_client_id.clear();
+        self.onboarding.message.clear();
+        self.config_path_display = config_location_display();
+        refresh_wallet_data(self);
+        self.status = status.to_string();
+    }
+
+    fn handle_onboarding_mode(&mut self, code: KeyCode) {
+        match self.onboarding.step {
+            OnboardingStep::ChooseBackend => match code {
+                KeyCode::Char('1') => {
+                    match persist_backend_choice(ConfigBackend::Local, None) {
+                        Ok(_) => self.complete_onboarding("Setup complete: using local config"),
+                        Err(err) => {
+                            self.onboarding.message = format!("Setup failed: {}", err);
+                        }
+                    }
+                }
+                KeyCode::Char('2') => {
+                    self.onboarding.step = OnboardingStep::BitwardenAuth;
+                    self.onboarding.input.clear();
+                    self.onboarding.message = match bw_status() {
+                        Ok(status) => format!(
+                            "Bitwarden status: {}. Press c=check, k=API login, u=unlock, i=continue.",
+                            status
+                        ),
+                        Err(err) => format!("Bitwarden check failed: {}. Press c to retry.", err),
+                    };
+                }
+                KeyCode::Char('q') => self.should_quit = true,
+                _ => {}
+            },
+            OnboardingStep::BitwardenAuth => match code {
+                KeyCode::Esc => {
+                    self.onboarding.step = OnboardingStep::ChooseBackend;
+                    self.onboarding.message = "Choose where config should live.".to_string();
+                }
+                KeyCode::Char('c') => {
+                    self.onboarding.message = match bw_status() {
+                        Ok(status) => format!(
+                            "Bitwarden status: {}. Press c=check, k=API login, u=unlock, i=continue.",
+                            status
+                        ),
+                        Err(err) => format!("Bitwarden check failed: {}", err),
+                    };
+                }
+                KeyCode::Char('k') => {
+                    self.onboarding.step = OnboardingStep::BitwardenApiKeyId;
+                    self.onboarding.input.clear();
+                    self.onboarding.message = "Enter Bitwarden API client ID.".to_string();
+                }
+                KeyCode::Char('u') => {
+                    self.onboarding.step = OnboardingStep::BitwardenMasterPassword;
+                    self.onboarding.input.clear();
+                    self.onboarding.message = "Enter Bitwarden master password.".to_string();
+                }
+                KeyCode::Char('i') => {
+                    match bw_status() {
+                        Ok(status) if status == "unlocked" => {
+                            self.onboarding.step = OnboardingStep::BitwardenItemId;
+                            self.onboarding.input.clear();
+                            self.onboarding.message =
+                                "Enter Bitwarden item ID (secure note).".to_string();
+                        }
+                        Ok(status) => {
+                            self.onboarding.message =
+                                format!("Bitwarden is '{}'. Login/unlock first.", status);
+                        }
+                        Err(err) => {
+                            self.onboarding.message = format!("Bitwarden check failed: {}", err);
+                        }
+                    }
+                }
+                _ => {}
+            },
+            OnboardingStep::BitwardenApiKeyId => match code {
+                KeyCode::Esc => {
+                    self.onboarding.step = OnboardingStep::BitwardenAuth;
+                    self.onboarding.input.clear();
+                }
+                KeyCode::Backspace => {
+                    self.onboarding.input.pop();
+                }
+                KeyCode::Char(ch) => {
+                    self.onboarding.input.push(ch);
+                }
+                KeyCode::Enter => {
+                    let client_id = self.onboarding.input.trim().to_string();
+                    if client_id.is_empty() {
+                        self.onboarding.message = "Client ID cannot be empty.".to_string();
+                    } else {
+                        self.onboarding.bw_client_id = client_id;
+                        self.onboarding.input.clear();
+                        self.onboarding.step = OnboardingStep::BitwardenApiKeySecret;
+                        self.onboarding.message = "Enter Bitwarden API client secret.".to_string();
+                    }
+                }
+                _ => {}
+            },
+            OnboardingStep::BitwardenApiKeySecret => match code {
+                KeyCode::Esc => {
+                    self.onboarding.step = OnboardingStep::BitwardenAuth;
+                    self.onboarding.input.clear();
+                }
+                KeyCode::Backspace => {
+                    self.onboarding.input.pop();
+                }
+                KeyCode::Char(ch) => {
+                    self.onboarding.input.push(ch);
+                }
+                KeyCode::Enter => {
+                    let client_secret = self.onboarding.input.trim().to_string();
+                    if client_secret.is_empty() {
+                        self.onboarding.message = "Client secret cannot be empty.".to_string();
+                    } else {
+                        match bw_login_with_apikey(&self.onboarding.bw_client_id, &client_secret) {
+                            Ok(_) => {
+                                self.onboarding.step = OnboardingStep::BitwardenAuth;
+                                self.onboarding.input.clear();
+                                self.onboarding.message =
+                                    "Bitwarden login successful. Press u to unlock vault.".to_string();
+                            }
+                            Err(err) => {
+                                self.onboarding.message =
+                                    format!("Bitwarden login failed: {}", err);
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            },
+            OnboardingStep::BitwardenMasterPassword => match code {
+                KeyCode::Esc => {
+                    self.onboarding.step = OnboardingStep::BitwardenAuth;
+                    self.onboarding.input.clear();
+                }
+                KeyCode::Backspace => {
+                    self.onboarding.input.pop();
+                }
+                KeyCode::Char(ch) => {
+                    self.onboarding.input.push(ch);
+                }
+                KeyCode::Enter => {
+                    let password = self.onboarding.input.clone();
+                    if password.trim().is_empty() {
+                        self.onboarding.message = "Password cannot be empty.".to_string();
+                    } else {
+                        match bw_unlock_with_password(password.trim()) {
+                            Ok(session) => {
+                                set_cached_bw_session(Some(session));
+                                self.onboarding.step = OnboardingStep::BitwardenAuth;
+                                self.onboarding.input.clear();
+                                self.onboarding.message =
+                                    "Vault unlocked. Press i to continue.".to_string();
+                            }
+                            Err(err) => {
+                                self.onboarding.message =
+                                    format!("Bitwarden unlock failed: {}", err);
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            },
+            OnboardingStep::BitwardenItemId => match code {
+                KeyCode::Esc => {
+                    self.onboarding.step = OnboardingStep::BitwardenAuth;
+                    self.onboarding.input.clear();
+                    self.onboarding.message =
+                        "Press c=check, k=API login, u=unlock, i=continue.".to_string();
+                }
+                KeyCode::Backspace => {
+                    self.onboarding.input.pop();
+                }
+                KeyCode::Char(ch) => {
+                    self.onboarding.input.push(ch);
+                }
+                KeyCode::Enter => {
+                    let item_id = self.onboarding.input.trim().to_string();
+                    if item_id.is_empty() {
+                        self.onboarding.message = "Bitwarden item ID cannot be empty.".to_string();
+                        return;
+                    }
+
+                    match initialize_bitwarden_config_item(&item_id)
+                        .and_then(|_| persist_backend_choice(ConfigBackend::Bitwarden, Some(item_id.clone())))
+                    {
+                        Ok(_) => self.complete_onboarding("Setup complete: using Bitwarden config"),
+                        Err(err) => {
+                            self.onboarding.message = format!("Bitwarden setup failed: {}", err);
+                        }
+                    }
+                }
+                _ => {}
+            },
         }
     }
 
@@ -557,13 +1362,15 @@ impl App {
                                                 name: name.clone(),
                                                 address,
                                                 has_key: true,
+                                                added_at: Some(Utc::now().format("%Y-%m-%d").to_string()),
                                             });
                                             if config.active_wallet.is_none() {
                                                 config.active_wallet = Some(wallet_id);
                                             }
                                             let _ = save_den_config(&config);
-                                            self.status = format!("Wallet '{}' imported", name);
+                                            let msg = format!("Wallet '{}' imported", name);
                                             refresh_wallet_data(self);
+                                            self.status = msg;
                                         }
                                         Err(err) => {
                                             self.status = format!("Keychain error: {}", err);
@@ -598,13 +1405,15 @@ impl App {
                                 name: name.clone(),
                                 address: input,
                                 has_key: false,
+                                added_at: Some(Utc::now().format("%Y-%m-%d").to_string()),
                             });
                             if config.active_wallet.is_none() {
                                 config.active_wallet = Some(wallet_id);
                             }
                             let _ = save_den_config(&config);
-                            self.status = format!("Watch-only wallet '{}' added", name);
+                            let msg = format!("Watch-only wallet '{}' added", name);
                             refresh_wallet_data(self);
+                            self.status = msg;
                         }
                     }
                     InputMode::RenameWallet => {
@@ -616,8 +1425,9 @@ impl App {
                             if let Some(w) = config.wallets.iter_mut().find(|w| w.id == wallet_id) {
                                 w.name = input.clone();
                                 let _ = save_den_config(&config);
-                                self.status = format!("Renamed to '{}'", input);
+                                let msg = format!("Renamed to '{}'", input);
                                 refresh_wallet_data(self);
+                                self.status = msg;
                             }
                         }
                     }
@@ -638,8 +1448,10 @@ impl App {
                             }
                             let _ = save_den_config(&config);
                             self.selected_account = 0;
-                            self.status = format!("Wallet '{}' removed", wallet_name);
+                            self.wallet_detail_index = None;
+                            let msg = format!("Wallet '{}' removed", wallet_name);
                             refresh_wallet_data(self);
+                            self.status = msg;
                         } else {
                             self.status = "Delete cancelled".to_string();
                         }
@@ -667,6 +1479,93 @@ impl App {
                             }
                         }
                     }
+                    InputMode::AddContactName => {
+                        if input.is_empty() {
+                            self.status = "Add contact cancelled".to_string();
+                        } else {
+                            self.import_state.wallet_name = input;
+                            self.input_mode = InputMode::AddContactAddress;
+                            self.input_buffer.clear();
+                            return;
+                        }
+                    }
+                    InputMode::AddContactAddress => {
+                        if input.is_empty() {
+                            self.status = "Add contact cancelled".to_string();
+                        } else {
+                            let contact = Contact {
+                                name: self.import_state.wallet_name.clone(),
+                                address: input,
+                                network: "mainnet".to_string(),
+                                notes: String::new(),
+                            };
+                            let name = contact.name.clone();
+                            self.contacts.push(contact);
+                            let mut file = load_contacts();
+                            file.contacts = self.contacts.clone();
+                            let _ = save_contacts(&file);
+                            self.status = format!("Contact '{}' added", name);
+                        }
+                    }
+                    InputMode::EditContactName => {
+                        if input.is_empty() {
+                            self.status = "Edit cancelled".to_string();
+                        } else {
+                            let idx = self.contact_detail_index.unwrap_or(self.selected_contact);
+                            if idx < self.contacts.len() {
+                                self.contacts[idx].name = input.clone();
+                                let mut file = load_contacts();
+                                file.contacts = self.contacts.clone();
+                                let _ = save_contacts(&file);
+                                self.status = format!("Contact updated to '{}'", input);
+                            }
+                        }
+                    }
+                    InputMode::EditContactAddress => {
+                        if input.is_empty() {
+                            self.status = "Edit cancelled".to_string();
+                        } else {
+                            if let Some(idx) = self.contact_detail_index {
+                                if idx < self.contacts.len() {
+                                    self.contacts[idx].address = input;
+                                    let mut file = load_contacts();
+                                    file.contacts = self.contacts.clone();
+                                    let _ = save_contacts(&file);
+                                    self.status = "Address updated".to_string();
+                                }
+                            }
+                        }
+                    }
+                    InputMode::EditContactNotes => {
+                        if let Some(idx) = self.contact_detail_index {
+                            if idx < self.contacts.len() {
+                                self.contacts[idx].notes = input;
+                                let mut file = load_contacts();
+                                file.contacts = self.contacts.clone();
+                                let _ = save_contacts(&file);
+                                self.status = "Notes updated".to_string();
+                            }
+                        }
+                    }
+                    InputMode::ConfirmDeleteContact => {
+                        if (input == "y" || input == "yes") && !self.contacts.is_empty() {
+                            let idx = self.contact_detail_index.unwrap_or(self.selected_contact);
+                            if idx < self.contacts.len() {
+                                let name = self.contacts[idx].name.clone();
+                                self.contacts.remove(idx);
+                                let mut file = load_contacts();
+                                file.contacts = self.contacts.clone();
+                                let _ = save_contacts(&file);
+                                self.contact_detail_index = None;
+                                if self.selected_contact >= self.contacts.len() && !self.contacts.is_empty() {
+                                    self.selected_contact = self.contacts.len() - 1;
+                                }
+                                self.status = format!("Contact '{}' deleted", name);
+                            }
+                        } else {
+                            self.status = "Delete cancelled".to_string();
+                        }
+                    }
                     InputMode::None => {}
                 }
                 self.input_mode = InputMode::None;
@@ -683,6 +1582,9 @@ impl App {
     }
 
     fn move_selection(&mut self, delta: isize) {
+        if self.wallet_detail_index.is_some() || self.contact_detail_index.is_some() {
+            return;
+        }
         let clamp = |value: isize, max: usize| -> usize {
             if max == 0 {
                 return 0;
@@ -749,15 +1651,21 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>) -> Result<(), Box<dyn Error>>
         }
     }
 
-    // Save contacts before exiting
-    let _ = save_contacts(&app.contacts);
-
     Ok(())
 }
 
 fn build_app() -> App {
     ensure_config_exists();
-    let den_config = load_den_config();
+    let mut den_config = load_den_config();
+    let needs_onboarding = should_start_onboarding();
+
+    // One-time: migrate API key from keychain to config
+    if den_config.network.api_key.is_none() && std::env::var("HELIUS_API_KEY").is_err() {
+        if let Ok(key) = load_api_key() {
+            den_config.network.api_key = Some(key);
+            let _ = save_den_config(&den_config);
+        }
+    }
 
     let default_network = match den_config.network.default.as_str() {
         "devnet" => Network::Devnet,
@@ -767,8 +1675,12 @@ fn build_app() -> App {
     let mut app = App::new_placeholder();
     app.network = default_network;
     app.default_network = den_config.network.default.clone();
+    app.config_path_display = config_location_display();
     app.keystore_status = keychain_status_summary(&den_config);
-    app.api_key_status = api_key_status();
+    app.contacts = load_contacts().contacts;
+    if needs_onboarding {
+        app.start_onboarding();
+    }
 
     refresh_wallet_data(&mut app);
 
@@ -798,10 +1710,12 @@ fn ui(frame: &mut ratatui::prelude::Frame, app: &App) {
     render_header(frame, layout[0], app.tab, area.width, app.network);
     render_body(frame, layout[1], app, area.width);
     if footer_height > 0 {
-        render_footer(frame, layout[2], &app.status, footer_height, app.tab);
+        render_footer(frame, layout[2], &app.status, footer_height, app.tab, app.wallet_detail_index.is_some() || app.contact_detail_index.is_some());
     }
 
-    if app.input_mode != InputMode::None {
+    if app.onboarding.active {
+        render_onboarding_modal(frame, app);
+    } else if app.input_mode != InputMode::None {
         render_input_modal(frame, app);
     }
 }
@@ -973,6 +1887,11 @@ fn render_overview(frame: &mut ratatui::prelude::Frame, area: Rect, app: &App, w
 }
 
 fn render_accounts(frame: &mut ratatui::prelude::Frame, area: Rect, app: &App) {
+    if let Some(index) = app.wallet_detail_index {
+        render_wallet_detail(frame, area, app, index);
+        return;
+    }
+
     let rows = app.accounts.iter().map(|account| {
         let marker = if account.is_active { "*" } else { " " };
         let wallet_type = if account.has_key { "Full" } else { "Watch" };
@@ -1005,7 +1924,7 @@ fn render_accounts(frame: &mut ratatui::prelude::Frame, area: Rect, app: &App) {
         Block::default()
             .borders(Borders::ALL)
             .border_style(Style::default().fg(COLOR_BARK))
-            .title("Wallets [Enter:switch a:add w:watch e:rename d:delete]"),
+            .title("Wallets [Enter:details a:add w:watch e:rename d:delete]"),
     )
     .row_highlight_style(
         Style::default()
@@ -1016,6 +1935,130 @@ fn render_accounts(frame: &mut ratatui::prelude::Frame, area: Rect, app: &App) {
     .highlight_symbol("> ");
 
     frame.render_stateful_widget(table, area, &mut table_state(app.selected_account));
+}
+
+fn render_wallet_detail(
+    frame: &mut ratatui::prelude::Frame,
+    area: Rect,
+    app: &App,
+    index: usize,
+) {
+    let account = match app.accounts.get(index) {
+        Some(a) => a,
+        None => {
+            let msg = Paragraph::new("Wallet not found")
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_style(Style::default().fg(COLOR_BARK))
+                        .title("Wallet Detail"),
+                )
+                .style(Style::default().fg(COLOR_EMBER));
+            frame.render_widget(msg, area);
+            return;
+        }
+    };
+
+    let wallet_type = if account.has_key {
+        "Full (signing key stored)"
+    } else {
+        "Watch-only"
+    };
+    let active_status = if account.is_active {
+        "Yes"
+    } else {
+        "No"
+    };
+    let added_display = account
+        .added_at
+        .as_deref()
+        .unwrap_or("Unknown");
+
+    let layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(14), Constraint::Min(0)])
+        .split(area);
+
+    let info = Text::from(vec![
+        Line::from(vec![
+            Span::styled("  Name:     ", Style::default().fg(COLOR_STONE)),
+            Span::styled(&account.name, Style::default().fg(COLOR_ASH)),
+        ]),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("  Address:  ", Style::default().fg(COLOR_STONE)),
+            Span::styled(&account.address, Style::default().fg(COLOR_ASH)),
+        ]),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("  Balance:  ", Style::default().fg(COLOR_STONE)),
+            Span::styled(&account.balance, Style::default().fg(COLOR_ASH)),
+        ]),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("  Type:     ", Style::default().fg(COLOR_STONE)),
+            Span::styled(wallet_type, Style::default().fg(COLOR_ASH)),
+        ]),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("  Active:   ", Style::default().fg(COLOR_STONE)),
+            Span::styled(
+                active_status,
+                Style::default().fg(if account.is_active {
+                    COLOR_MOSS
+                } else {
+                    COLOR_STONE
+                }),
+            ),
+        ]),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("  Added:    ", Style::default().fg(COLOR_STONE)),
+            Span::styled(added_display, Style::default().fg(COLOR_ASH)),
+        ]),
+    ]);
+
+    let paragraph = Paragraph::new(info)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(COLOR_BARK))
+                .title(format!("Wallet: {}", account.name)),
+        )
+        .style(Style::default().fg(COLOR_ASH));
+
+    frame.render_widget(paragraph, layout[0]);
+
+    let hints = Text::from(vec![
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("  Enter", Style::default().fg(COLOR_FAWN).add_modifier(Modifier::BOLD)),
+            Span::styled("  Set as active wallet", Style::default().fg(COLOR_ASH)),
+        ]),
+        Line::from(vec![
+            Span::styled("  e", Style::default().fg(COLOR_FAWN).add_modifier(Modifier::BOLD)),
+            Span::styled("      Rename wallet", Style::default().fg(COLOR_ASH)),
+        ]),
+        Line::from(vec![
+            Span::styled("  d", Style::default().fg(COLOR_FAWN).add_modifier(Modifier::BOLD)),
+            Span::styled("      Delete wallet", Style::default().fg(COLOR_ASH)),
+        ]),
+        Line::from(vec![
+            Span::styled("  Esc", Style::default().fg(COLOR_FAWN).add_modifier(Modifier::BOLD)),
+            Span::styled("    Back to wallet list", Style::default().fg(COLOR_ASH)),
+        ]),
+    ]);
+
+    let actions = Paragraph::new(hints)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(COLOR_BARK))
+                .title("Actions"),
+        )
+        .style(Style::default().fg(COLOR_ASH));
+
+    frame.render_widget(actions, layout[1]);
 }
 
 fn render_tokens_view(frame: &mut ratatui::prelude::Frame, area: Rect, app: &App, width: u16) {
@@ -1172,11 +2215,21 @@ fn render_history_list(frame: &mut ratatui::prelude::Frame, area: Rect, app: &Ap
 }
 
 fn render_address_book(frame: &mut ratatui::prelude::Frame, area: Rect, app: &App) {
+    if let Some(index) = app.contact_detail_index {
+        render_contact_detail(frame, area, app, index);
+        return;
+    }
+
     let items = app
         .contacts
         .iter()
         .map(|contact| {
-            let line = format!("{}  {}", contact.name, contact.address);
+            let line = format!(
+                "{}  {}  [{}]",
+                contact.name,
+                short_address(&contact.address),
+                contact.network
+            );
             ListItem::new(Line::from(line))
         })
         .collect::<Vec<_>>();
@@ -1186,7 +2239,7 @@ fn render_address_book(frame: &mut ratatui::prelude::Frame, area: Rect, app: &Ap
             Block::default()
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(COLOR_BARK))
-                .title("Address Book"),
+                .title("Address Book [Enter:details a:add e:edit d:delete]"),
         )
         .highlight_style(
             Style::default()
@@ -1198,6 +2251,108 @@ fn render_address_book(frame: &mut ratatui::prelude::Frame, area: Rect, app: &Ap
         .style(Style::default().fg(COLOR_ASH));
 
     frame.render_stateful_widget(list, area, &mut list_state(app.selected_contact));
+}
+
+fn render_contact_detail(
+    frame: &mut ratatui::prelude::Frame,
+    area: Rect,
+    app: &App,
+    index: usize,
+) {
+    let contact = match app.contacts.get(index) {
+        Some(c) => c,
+        None => {
+            let msg = Paragraph::new("Contact not found")
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_style(Style::default().fg(COLOR_BARK))
+                        .title("Contact Detail"),
+                )
+                .style(Style::default().fg(COLOR_EMBER));
+            frame.render_widget(msg, area);
+            return;
+        }
+    };
+
+    let notes_display = if contact.notes.is_empty() {
+        "(none)"
+    } else {
+        &contact.notes
+    };
+
+    let layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(12), Constraint::Min(0)])
+        .split(area);
+
+    let info = Text::from(vec![
+        Line::from(vec![
+            Span::styled("  Name:     ", Style::default().fg(COLOR_STONE)),
+            Span::styled(&contact.name, Style::default().fg(COLOR_ASH)),
+        ]),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("  Address:  ", Style::default().fg(COLOR_STONE)),
+            Span::styled(&contact.address, Style::default().fg(COLOR_ASH)),
+        ]),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("  Network:  ", Style::default().fg(COLOR_STONE)),
+            Span::styled(&contact.network, Style::default().fg(COLOR_ASH)),
+        ]),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("  Notes:    ", Style::default().fg(COLOR_STONE)),
+            Span::styled(notes_display, Style::default().fg(COLOR_ASH)),
+        ]),
+    ]);
+
+    let paragraph = Paragraph::new(info)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(COLOR_BARK))
+                .title(format!("Contact: {}", contact.name)),
+        )
+        .style(Style::default().fg(COLOR_ASH));
+
+    frame.render_widget(paragraph, layout[0]);
+
+    let hints = Text::from(vec![
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("  e", Style::default().fg(COLOR_FAWN).add_modifier(Modifier::BOLD)),
+            Span::styled("      Edit name", Style::default().fg(COLOR_ASH)),
+        ]),
+        Line::from(vec![
+            Span::styled("  a", Style::default().fg(COLOR_FAWN).add_modifier(Modifier::BOLD)),
+            Span::styled("      Edit address", Style::default().fg(COLOR_ASH)),
+        ]),
+        Line::from(vec![
+            Span::styled("  o", Style::default().fg(COLOR_FAWN).add_modifier(Modifier::BOLD)),
+            Span::styled("      Edit notes", Style::default().fg(COLOR_ASH)),
+        ]),
+        Line::from(vec![
+            Span::styled("  d", Style::default().fg(COLOR_FAWN).add_modifier(Modifier::BOLD)),
+            Span::styled("      Delete contact", Style::default().fg(COLOR_ASH)),
+        ]),
+        Line::from(vec![
+            Span::styled("  Esc", Style::default().fg(COLOR_FAWN).add_modifier(Modifier::BOLD)),
+            Span::styled("    Back to contact list", Style::default().fg(COLOR_ASH)),
+        ]),
+    ]);
+
+    let actions = Paragraph::new(hints)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(COLOR_BARK))
+                .title("Actions"),
+        )
+        .style(Style::default().fg(COLOR_ASH));
+
+    frame.render_widget(actions, layout[1]);
 }
 
 fn render_send(frame: &mut ratatui::prelude::Frame, area: Rect, app: &App) {
@@ -1302,37 +2457,135 @@ fn render_receive(frame: &mut ratatui::prelude::Frame, area: Rect, app: &App) {
 }
 
 fn render_settings(frame: &mut ratatui::prelude::Frame, area: Rect, app: &App) {
-    let settings = Text::from(vec![
-        Line::from(format!(
-            "Network: {} (press n to toggle)",
-            app.network.label()
-        )),
-        Line::from(format!("Default network: {}", app.default_network)),
-        Line::from(format!("Wallet address: {}", app.wallet_address)),
-        Line::from(app.keystore_status.clone()),
-        Line::from(app.api_key_status.clone()),
-        Line::from(format!("Config: {}", app.config_path_display)),
-        Line::from(""),
-        Line::from("Import key: press i, paste, enter"),
-        Line::from("Sign message: press s, enter message"),
-        Line::from(format!("Last signature: {}", app.last_signature)),
+    let active_name = app
+        .accounts
+        .iter()
+        .find(|a| a.is_active)
+        .map(|a| a.name.as_str())
+        .unwrap_or("None");
+    let wallet_count = app.accounts.len();
+    let full_count = app.accounts.iter().filter(|a| a.has_key).count();
+    let watch_count = wallet_count - full_count;
+
+    let layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(10),
+            Constraint::Length(10),
+            Constraint::Min(0),
+        ])
+        .split(area);
+
+    let network_section = Text::from(vec![
+        Line::from(vec![
+            Span::styled("  Network:    ", Style::default().fg(COLOR_STONE)),
+            Span::styled(app.network.label(), Style::default().fg(COLOR_ASH)),
+            Span::styled("  (n to toggle)", Style::default().fg(COLOR_STONE)),
+        ]),
+        Line::from(vec![
+            Span::styled("  Default:    ", Style::default().fg(COLOR_STONE)),
+            Span::styled(&app.default_network, Style::default().fg(COLOR_ASH)),
+        ]),
+        Line::from(vec![
+            Span::styled("  API Key:    ", Style::default().fg(COLOR_STONE)),
+            Span::styled(&app.api_key_status, Style::default().fg(COLOR_ASH)),
+        ]),
+        Line::from(vec![
+            Span::styled("  Config:     ", Style::default().fg(COLOR_STONE)),
+            Span::styled(&app.config_path_display, Style::default().fg(COLOR_ASH)),
+        ]),
     ]);
 
-    let paragraph = Paragraph::new(settings)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(COLOR_BARK))
-                .title("Settings"),
-        )
-        .style(Style::default().fg(COLOR_ASH));
+    let wallet_section = Text::from(vec![
+        Line::from(vec![
+            Span::styled("  Active:     ", Style::default().fg(COLOR_STONE)),
+            Span::styled(active_name, Style::default().fg(COLOR_ASH)),
+        ]),
+        Line::from(vec![
+            Span::styled("  Address:    ", Style::default().fg(COLOR_STONE)),
+            Span::styled(&app.wallet_address, Style::default().fg(COLOR_ASH)),
+        ]),
+        Line::from(vec![
+            Span::styled("  Wallets:    ", Style::default().fg(COLOR_STONE)),
+            Span::styled(
+                format!("{} total ({} full, {} watch-only)", wallet_count, full_count, watch_count),
+                Style::default().fg(COLOR_ASH),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("  Last sig:   ", Style::default().fg(COLOR_STONE)),
+            Span::styled(&app.last_signature, Style::default().fg(COLOR_ASH)),
+        ]),
+    ]);
 
-    frame.render_widget(paragraph, area);
+    let shortcuts = Text::from(vec![
+        Line::from(vec![
+            Span::styled("  n", Style::default().fg(COLOR_FAWN).add_modifier(Modifier::BOLD)),
+            Span::styled("  Toggle network", Style::default().fg(COLOR_ASH)),
+        ]),
+        Line::from(vec![
+            Span::styled("  r", Style::default().fg(COLOR_FAWN).add_modifier(Modifier::BOLD)),
+            Span::styled("  Refresh data", Style::default().fg(COLOR_ASH)),
+        ]),
+        Line::from(vec![
+            Span::styled("  i", Style::default().fg(COLOR_FAWN).add_modifier(Modifier::BOLD)),
+            Span::styled("  Import wallet", Style::default().fg(COLOR_ASH)),
+        ]),
+        Line::from(vec![
+            Span::styled("  s", Style::default().fg(COLOR_FAWN).add_modifier(Modifier::BOLD)),
+            Span::styled("  Sign message", Style::default().fg(COLOR_ASH)),
+        ]),
+        Line::from(vec![
+            Span::styled("  o", Style::default().fg(COLOR_FAWN).add_modifier(Modifier::BOLD)),
+            Span::styled("  Run setup wizard (Settings tab)", Style::default().fg(COLOR_ASH)),
+        ]),
+        Line::from(vec![
+            Span::styled("  2", Style::default().fg(COLOR_FAWN).add_modifier(Modifier::BOLD)),
+            Span::styled("  Manage wallets (Accounts tab)", Style::default().fg(COLOR_ASH)),
+        ]),
+    ]);
+
+    frame.render_widget(
+        Paragraph::new(network_section)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(COLOR_BARK))
+                    .title("Configuration"),
+            )
+            .style(Style::default().fg(COLOR_ASH)),
+        layout[0],
+    );
+    frame.render_widget(
+        Paragraph::new(wallet_section)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(COLOR_BARK))
+                    .title("Wallets"),
+            )
+            .style(Style::default().fg(COLOR_ASH)),
+        layout[1],
+    );
+    frame.render_widget(
+        Paragraph::new(shortcuts)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(COLOR_BARK))
+                    .title("Shortcuts"),
+            )
+            .style(Style::default().fg(COLOR_ASH)),
+        layout[2],
+    );
 }
 
-fn footer_nav_text(tab: Tab) -> &'static str {
+fn footer_nav_text(tab: Tab, in_detail: bool) -> &'static str {
     match tab {
-        Tab::Accounts => "1-8 | Enter:switch | a:add | w:watch | e:rename | d:delete | r:refresh | q:quit",
+        Tab::Accounts if in_detail => "Enter:activate | e:rename | d:delete | Esc:back | q:quit",
+        Tab::Accounts => "Enter:details | a:add | w:watch | e:rename | d:delete | r:refresh | q:quit",
+        Tab::AddressBook if in_detail => "e:name | a:address | o:notes | d:delete | Esc:back",
+        Tab::AddressBook => "Enter:details | a:add | e:edit | d:delete | q:quit",
         _ => "1-8 | up/down | n:network | i:import | s:sign | r:refresh | q:quit",
     }
 }
@@ -1343,8 +2596,9 @@ fn render_footer(
     status: &str,
     height: u16,
     tab: Tab,
+    in_detail: bool,
 ) {
-    let nav_text = footer_nav_text(tab);
+    let nav_text = footer_nav_text(tab, in_detail);
     if height == 1 {
         let content = format!("{} | {}", nav_text, status);
         let footer = Paragraph::new(content)
@@ -1401,6 +2655,85 @@ fn active_account(app: &App) -> (String, String) {
         .unwrap_or_else(|| ("None".to_string(), "Unset".to_string()))
 }
 
+fn render_onboarding_modal(frame: &mut ratatui::prelude::Frame, app: &App) {
+    let area = frame.area();
+    let modal_width = area.width.saturating_sub(6).min(86).max(24);
+    let modal_height = 11u16;
+    let x = area.x + (area.width.saturating_sub(modal_width)) / 2;
+    let y = area.y + (area.height.saturating_sub(modal_height)) / 2;
+    let modal = Rect::new(x, y, modal_width, modal_height);
+
+    let (prompt, input_line, hints): (String, String, Vec<String>) = match app.onboarding.step {
+        OnboardingStep::ChooseBackend => (
+            "Choose configuration backend:".to_string(),
+            "".to_string(),
+            vec![
+                "1) This Mac (local file)".to_string(),
+                "2) Bitwarden (sync across machines)".to_string(),
+                "q) Quit".to_string(),
+            ],
+        ),
+        OnboardingStep::BitwardenAuth => (
+            "Bitwarden auth required before selecting config item.".to_string(),
+            "".to_string(),
+            vec![
+                "c) Check status".to_string(),
+                "k) Login with API key".to_string(),
+                "u) Unlock with master password".to_string(),
+                "i) Continue to item ID once unlocked".to_string(),
+                "Esc) Back".to_string(),
+            ],
+        ),
+        OnboardingStep::BitwardenApiKeyId => (
+            "Enter Bitwarden API client ID:".to_string(),
+            app.onboarding.input.clone(),
+            vec!["Enter to continue, Esc to cancel".to_string()],
+        ),
+        OnboardingStep::BitwardenApiKeySecret => (
+            "Enter Bitwarden API client secret:".to_string(),
+            "*".repeat(app.onboarding.input.len()),
+            vec!["Enter to submit, Esc to cancel".to_string()],
+        ),
+        OnboardingStep::BitwardenMasterPassword => (
+            "Enter Bitwarden master password:".to_string(),
+            "*".repeat(app.onboarding.input.len()),
+            vec!["Enter to unlock, Esc to cancel".to_string()],
+        ),
+        OnboardingStep::BitwardenItemId => (
+            "Enter Bitwarden config item ID:".to_string(),
+            app.onboarding.input.clone(),
+            vec![
+                "Enter to continue, Esc to go back".to_string(),
+            ],
+        ),
+    };
+
+    let mut lines = vec![
+        Line::from(prompt),
+        Line::from(""),
+        Line::from(input_line),
+        Line::from(""),
+    ];
+    for hint in hints {
+        lines.push(Line::from(hint));
+    }
+    if !app.onboarding.message.is_empty() {
+        lines.push(Line::from(""));
+        lines.push(Line::from(app.onboarding.message.clone()));
+    }
+
+    let paragraph = Paragraph::new(Text::from(lines))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(COLOR_BARK))
+                .title("Setup"),
+        )
+        .style(Style::default().fg(COLOR_ASH));
+
+    frame.render_widget(paragraph, modal);
+}
+
 fn render_input_modal(frame: &mut ratatui::prelude::Frame, app: &App) {
     let area = frame.area();
     let modal_width = area.width.saturating_sub(8).min(80).max(20);
@@ -1415,6 +2748,15 @@ fn render_input_modal(frame: &mut ratatui::prelude::Frame, app: &App) {
         .map(|a| a.name.clone())
         .unwrap_or_else(|| "?".to_string());
     let delete_prompt = format!("Delete '{}'? Type 'y' to confirm:", delete_name);
+
+    let contact_delete_name = {
+        let idx = app.contact_detail_index.unwrap_or(app.selected_contact);
+        app.contacts
+            .get(idx)
+            .map(|c| c.name.clone())
+            .unwrap_or_else(|| "?".to_string())
+    };
+    let contact_delete_prompt = format!("Delete '{}'? Type 'y' to confirm:", contact_delete_name);
 
     let (title, prompt, display): (&str, String, String) = match app.input_mode {
         InputMode::ImportKeyName => (
@@ -1455,6 +2797,36 @@ fn render_input_modal(frame: &mut ratatui::prelude::Frame, app: &App) {
             "Enter message and press Enter:".to_string(),
             app.input_buffer.clone(),
         ),
+        InputMode::AddContactName => (
+            "Add Contact",
+            "Enter contact name:".to_string(),
+            app.input_buffer.clone(),
+        ),
+        InputMode::AddContactAddress => (
+            "Add Contact",
+            "Enter wallet address:".to_string(),
+            app.input_buffer.clone(),
+        ),
+        InputMode::EditContactName => (
+            "Edit Contact",
+            "Enter new name:".to_string(),
+            app.input_buffer.clone(),
+        ),
+        InputMode::EditContactAddress => (
+            "Edit Contact",
+            "Enter new address:".to_string(),
+            app.input_buffer.clone(),
+        ),
+        InputMode::EditContactNotes => (
+            "Edit Notes",
+            "Enter notes (or leave empty to clear):".to_string(),
+            app.input_buffer.clone(),
+        ),
+        InputMode::ConfirmDeleteContact => (
+            "Delete Contact",
+            contact_delete_prompt,
+            app.input_buffer.clone(),
+        ),
         InputMode::None => ("", String::new(), String::new()),
     };
 
@@ -1491,6 +2863,8 @@ fn status_style(message: &str) -> Style {
         || lower.contains("switched")
         || lower.contains("renamed")
         || lower.contains("removed")
+        || lower.contains("updated")
+        || lower.contains("deleted")
     {
         Style::default().fg(COLOR_MOSS)
     } else {
@@ -1564,6 +2938,7 @@ fn handle_cli() -> Result<bool, Box<dyn Error>> {
                     name: "Imported".to_string(),
                     address: address.clone(),
                     has_key: true,
+                    added_at: Some(Utc::now().format("%Y-%m-%d").to_string()),
                 });
                 if config.active_wallet.is_none() {
                     config.active_wallet = Some(wallet_id.clone());
@@ -1587,6 +2962,7 @@ fn handle_cli() -> Result<bool, Box<dyn Error>> {
                     name: name.clone(),
                     address: address.clone(),
                     has_key: true,
+                    added_at: Some(Utc::now().format("%Y-%m-%d").to_string()),
                 });
                 if config.active_wallet.is_none() {
                     config.active_wallet = Some(wallet_id.clone());
@@ -1606,6 +2982,7 @@ fn handle_cli() -> Result<bool, Box<dyn Error>> {
                     name: name.clone(),
                     address: address.clone(),
                     has_key: false,
+                    added_at: Some(Utc::now().format("%Y-%m-%d").to_string()),
                 });
                 if config.active_wallet.is_none() {
                     config.active_wallet = Some(wallet_id.clone());
@@ -1714,52 +3091,22 @@ fn handle_cli() -> Result<bool, Box<dyn Error>> {
                 }
                 return Ok(true);
             }
-            "--add-contact" => {
-                let name = args.next().ok_or("--add-contact requires name and address")?;
-                let address = args.next().ok_or("--add-contact requires name and address")?;
-                
-                let mut contacts = load_contacts().unwrap_or_else(|_| default_contacts());
-                contacts.push(Contact { name, address });
-                save_contacts(&contacts)?;
-                println!("Contact added successfully");
-                return Ok(true);
-            }
-            "--remove-contact" => {
-                let name = args.next().ok_or("--remove-contact requires contact name")?;
-                let mut contacts = load_contacts().unwrap_or_else(|_| default_contacts());
-                contacts.retain(|c| c.name != name);
-                save_contacts(&contacts)?;
-                println!("Contact removed successfully");
-                return Ok(true);
-            }
-            "--list-contacts" => {
-                let contacts = load_contacts().unwrap_or_else(|_| default_contacts());
-                if contacts.is_empty() {
-                    println!("No contacts found");
-                } else {
-                    println!("Address Book:");
-                    for contact in contacts {
-                        println!("  {} -> {}", contact.name, contact.address);
-                    }
-                }
-                return Ok(true);
-            }
-            "--help" => {
-                println!("Den Wallet CLI");
-                println!("  --import              Store key from DEN_SECRET_KEY in Keychain");
-                println!("  --clear               Remove key from Keychain");
-                println!("  --add-contact <name> <addr>   Add a contact");
-                println!("  --remove-contact <name>       Remove a contact");
-                println!("  --list-contacts               List all contacts");
             "--set-api-key" => {
                 let key = args.next().ok_or("Usage: den --set-api-key <KEY>")?;
-                store_api_key(&key)?;
-                println!("API key stored in Keychain.");
+                ensure_config_exists();
+                let mut config = load_den_config();
+                config.network.api_key = Some(key);
+                save_den_config(&config)?;
+                println!("API key saved to config.");
                 return Ok(true);
             }
             "--clear-api-key" => {
-                clear_api_key()?;
-                println!("API key removed from Keychain.");
+                ensure_config_exists();
+                let mut config = load_den_config();
+                config.network.api_key = None;
+                save_den_config(&config)?;
+                let _ = clear_api_key();
+                println!("API key removed.");
                 return Ok(true);
             }
             "--set-network" => {
@@ -1776,25 +3123,23 @@ fn handle_cli() -> Result<bool, Box<dyn Error>> {
                 }
                 return Ok(true);
             }
+            "--migrate-config-to-bitwarden" => {
+                let force = matches!(args.next().as_deref(), Some("--force"));
+                let location = migrate_local_config_to_bitwarden(force)?;
+                println!("Migrated local config to {}.", location);
+                return Ok(true);
+            }
             "--config-path" => {
-                match config_path() {
-                    Some(path) => println!("{}", path.display()),
-                    None => println!("Could not determine config directory"),
-                }
+                println!("{}", config_location_display());
                 return Ok(true);
             }
             "--status" => {
                 ensure_config_exists();
                 let config = load_den_config();
                 println!("Den Wallet Status");
-                println!(
-                    "  Config: {}",
-                    config_path()
-                        .map(|p| format!("{}", p.display()))
-                        .unwrap_or("unavailable".into())
-                );
+                println!("  Config: {}", config_location_display());
                 println!("  Default network: {}", config.network.default);
-                println!("  {}", api_key_status());
+                println!("  {}", api_key_status(&config));
                 println!("  Wallets: {}", config.wallets.len());
                 let active_name = active_wallet(&config)
                     .map(|w| w.name.as_str())
@@ -1811,6 +3156,64 @@ fn handle_cli() -> Result<bool, Box<dyn Error>> {
                 }
                 return Ok(true);
             }
+            "--list-contacts" => {
+                let file = load_contacts();
+                if file.contacts.is_empty() {
+                    println!("No contacts.");
+                } else {
+                    for c in &file.contacts {
+                        let notes = if c.notes.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" -- {}", c.notes)
+                        };
+                        println!(
+                            "  {} [{}] {}{}",
+                            c.name,
+                            c.network,
+                            short_address(&c.address),
+                            notes
+                        );
+                    }
+                }
+                return Ok(true);
+            }
+            "--export-contacts" => {
+                let file = load_contacts();
+                let json = serde_json::to_string_pretty(&file)?;
+                match args.next() {
+                    Some(path) => {
+                        std::fs::write(&path, &json)?;
+                        println!("Exported {} contacts to {}", file.contacts.len(), path);
+                    }
+                    None => {
+                        println!("{}", json);
+                    }
+                }
+                return Ok(true);
+            }
+            "--import-contacts" => {
+                let path = args.next().ok_or("Usage: den --import-contacts <file>")?;
+                let contents = std::fs::read_to_string(&path)?;
+                let incoming: ContactsFile = serde_json::from_str(&contents)?;
+                let mut file = load_contacts();
+                let mut added = 0u32;
+                let mut skipped = 0u32;
+                for contact in incoming.contacts {
+                    if file.contacts.iter().any(|c| c.address == contact.address) {
+                        skipped += 1;
+                    } else {
+                        file.contacts.push(contact);
+                        added += 1;
+                    }
+                }
+                save_contacts(&file)?;
+                println!(
+                    "Imported {} contacts, skipped {} duplicates.",
+                    added, skipped
+                );
+                return Ok(true);
+            }
             "--help" => {
                 println!("Den Wallet CLI");
                 println!();
@@ -1824,11 +3227,17 @@ fn handle_cli() -> Result<bool, Box<dyn Error>> {
                 println!("  --import                Import key from DEN_SECRET_KEY (legacy)");
                 println!("  --clear [NAME]          Remove private key (active or named)");
                 println!();
+                println!("Contacts:");
+                println!("  --list-contacts         List all contacts");
+                println!("  --export-contacts [FILE] Export contacts as JSON (stdout or file)");
+                println!("  --import-contacts FILE  Import contacts from JSON, skip duplicates");
+                println!();
                 println!("Configuration:");
-                println!("  --set-api-key KEY       Store Helius API key in Keychain");
-                println!("  --clear-api-key         Remove API key from Keychain");
+                println!("  --set-api-key KEY       Store Helius API key in config");
+                println!("  --clear-api-key         Remove API key");
                 println!("  --set-network NET       Set default network (mainnet|devnet)");
-                println!("  --config-path           Show config file location");
+                println!("  --migrate-config-to-bitwarden [--force]  Copy local config to Bitwarden");
+                println!("  --config-path           Show active config location");
                 println!("  --status                Show full status");
                 return Ok(true);
             }
@@ -1869,12 +3278,6 @@ fn keychain_status_summary(config: &DenConfig) -> String {
     }
 }
 
-fn store_api_key(api_key: &str) -> Result<(), Box<dyn Error>> {
-    let entry = keyring::Entry::new(KEYCHAIN_SERVICE, KEYCHAIN_API_KEY_ACCOUNT)?;
-    entry.set_password(api_key)?;
-    Ok(())
-}
-
 fn load_api_key() -> Result<String, Box<dyn Error>> {
     let entry = keyring::Entry::new(KEYCHAIN_SERVICE, KEYCHAIN_API_KEY_ACCOUNT)?;
     Ok(entry.get_password()?)
@@ -1889,16 +3292,14 @@ fn clear_api_key() -> Result<(), Box<dyn Error>> {
     }
 }
 
-fn api_key_status() -> String {
-    let entry = match keyring::Entry::new(KEYCHAIN_SERVICE, KEYCHAIN_API_KEY_ACCOUNT) {
-        Ok(entry) => entry,
-        Err(_) => return "API Key: unavailable".to_string(),
-    };
-    match entry.get_password() {
-        Ok(_) => "API Key: stored".to_string(),
-        Err(keyring::Error::NoEntry) => "API Key: not set".to_string(),
-        Err(_) => "API Key: error".to_string(),
+fn api_key_status(config: &DenConfig) -> String {
+    if std::env::var("HELIUS_API_KEY").is_ok() {
+        return "API Key: set (env)".to_string();
     }
+    if config.network.api_key.is_some() {
+        return "API Key: set (config)".to_string();
+    }
+    "API Key: not set -- run: den --set-api-key <key>".to_string()
 }
 
 fn keypair_from_secret(secret: &str) -> Result<Keypair, Box<dyn Error>> {
@@ -1931,10 +3332,10 @@ fn sign_message_with_wallet(wallet_id: &str, message: &str) -> Result<String, Bo
     Ok(signature.to_string())
 }
 
-fn resolve_api_key() -> Option<String> {
+fn resolve_api_key(config: &DenConfig) -> Option<String> {
     std::env::var("HELIUS_API_KEY")
         .ok()
-        .or_else(|| load_api_key().ok())
+        .or_else(|| config.network.api_key.clone())
 }
 
 fn build_rpc_url(api_key: &str, network: Network) -> String {
@@ -1960,9 +3361,9 @@ fn fetch_sol_balance(
 fn refresh_wallet_data(app: &mut App) {
     let den_config = load_den_config();
     app.keystore_status = keychain_status_summary(&den_config);
-    app.api_key_status = api_key_status();
+    app.api_key_status = api_key_status(&den_config);
 
-    let api_key = match resolve_api_key() {
+    let api_key = match resolve_api_key(&den_config) {
         Some(key) => key,
         None => {
             app.status = "No API key. Run: den --set-api-key <key>".to_string();
@@ -1977,6 +3378,7 @@ fn refresh_wallet_data(app: &mut App) {
                     balance: "-.-- SOL".to_string(),
                     has_key: w.has_key,
                     is_active: den_config.active_wallet.as_deref() == Some(w.id.as_str()),
+                    added_at: w.added_at.clone(),
                 })
                 .collect();
             return;
@@ -2001,6 +3403,7 @@ fn refresh_wallet_data(app: &mut App) {
             balance,
             has_key: wallet.has_key,
             is_active,
+            added_at: wallet.added_at.clone(),
         });
     }
     app.accounts = accounts;
@@ -2008,7 +3411,6 @@ fn refresh_wallet_data(app: &mut App) {
     // Full fetch for active wallet only
     if let Some(active) = active_wallet(&den_config) {
         let config = Config {
-            api_key,
             address: active.address.clone(),
             rpc_url,
         };
@@ -2233,68 +3635,4 @@ fn short_address(value: &str) -> String {
         return value.to_string();
     }
     format!("{}...{}", &value[..4], &value[length - 4..])
-}
-
-fn contacts_config_path() -> Result<PathBuf, Box<dyn Error>> {
-    let config_home = std::env::var("XDG_CONFIG_HOME")
-        .ok()
-        .or_else(|| {
-            std::env::var("HOME").ok().map(|home| {
-                format!("{}/.config", home)
-            })
-        })
-        .unwrap_or_else(|| ".config".to_string());
-
-    let config_dir = PathBuf::from(config_home).join("den");
-    fs::create_dir_all(&config_dir)?;
-    Ok(config_dir.join("contacts.json"))
-}
-
-fn default_contacts() -> Vec<Contact> {
-    vec![
-        Contact {
-            name: "Trader Joe".to_string(),
-            address: "Den9k...9aX1".to_string(),
-        },
-        Contact {
-            name: "Ops Vault".to_string(),
-            address: "Den5m...7bN2".to_string(),
-        },
-        Contact {
-            name: "Laptop".to_string(),
-            address: "Den2g...2gP8".to_string(),
-        },
-    ]
-}
-
-fn load_contacts() -> Result<Vec<Contact>, Box<dyn Error>> {
-    let path = contacts_config_path()?;
-
-    if path.exists() {
-        let content = fs::read_to_string(&path)?;
-        let config: ContactsConfig = serde_json::from_str(&content)?;
-        return Ok(config.contacts);
-    }
-
-    // First run: create default config
-    let contacts = default_contacts();
-    let config = ContactsConfig {
-        version: 1,
-        contacts: contacts.clone(),
-    };
-    let content = serde_json::to_string_pretty(&config)?;
-    fs::write(&path, content)?;
-
-    Ok(contacts)
-}
-
-fn save_contacts(contacts: &[Contact]) -> Result<(), Box<dyn Error>> {
-    let path = contacts_config_path()?;
-    let config = ContactsConfig {
-        version: 1,
-        contacts: contacts.to_vec(),
-    };
-    let content = serde_json::to_string_pretty(&config)?;
-    fs::write(&path, content)?;
-    Ok(())
 }
