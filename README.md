@@ -78,15 +78,28 @@ Wallet secrets are stored in macOS Keychain. Config can be local or centralized 
 
 ### CLI Commands
 ```
---import           Store key from DEN_SECRET_KEY in Keychain
---clear            Remove private key from Keychain
---set-api-key KEY  Store Helius API key in config
---clear-api-key    Remove API key from config
---set-network NET  Set default network (mainnet|devnet)
+Wallet Management:
+--add-wallet NAME       Import key from DEN_SECRET_KEY with name
+--add-watch NAME ADDR   Add a watch-only wallet
+--list-wallets          List all wallets
+--switch-wallet NAME    Set active wallet by name or ID
+--rename-wallet NAME NEW  Rename a wallet
+--remove-wallet NAME    Remove a wallet
+--import                Import key from DEN_SECRET_KEY (legacy)
+--clear [NAME]          Remove private key (active or named)
+
+Contacts:
+--list-contacts         List all contacts
+--export-contacts [FILE] Export contacts as JSON (stdout or file)
+--import-contacts FILE  Import contacts from JSON, skip duplicates
+
+Configuration:
+--set-api-key KEY       Store Helius API key in config
+--clear-api-key         Remove API key
+--set-network NET       Set default network (mainnet|devnet)
 --migrate-config-to-bitwarden [--force]  Copy local config to Bitwarden
---config-path      Show active config location
---status           Show current configuration status
---help             Show all commands
+--config-path           Show active config location
+--status                Show full status
 ```
 
 ## Feature Status
@@ -103,7 +116,7 @@ Wallet secrets are stored in macOS Keychain. Config can be local or centralized 
 | Generate new keypair | Not started | |
 | Mnemonic / seed phrase (BIP39) | Not started | |
 | HD derivation (BIP44 m/44'/501') | Not started | |
-| Multiple accounts / wallets | Not started | Single account only |
+| Multiple accounts / wallets | Done | Full and watch-only wallets supported |
 | Export / backup key | Not started | |
 | Password / PIN protection | Not started | |
 | Session auto-lock | Not started | |
@@ -157,9 +170,9 @@ Wallet secrets are stored in macOS Keychain. Config can be local or centralized 
 
 | Feature | Status | Notes |
 |---------|--------|-------|
-| View contacts | Done | Hardcoded placeholder entries |
-| Add / edit / delete contacts | Not started | |
-| Persistent storage | Not started | Contacts reset on restart |
+| View contacts | Done | CLI list and TUI address book |
+| Add / edit / delete contacts | Partial | Import/export supported, interactive editing still limited |
+| Persistent storage | Done | Contacts saved to local JSON config |
 
 ### TUI / UX
 
@@ -182,13 +195,22 @@ Wallet secrets are stored in macOS Keychain. Config can be local or centralized 
 
 | Feature | Status | Notes |
 |---------|--------|-------|
-| `--import` | Done | Reads `DEN_SECRET_KEY` env var |
-| `--clear` | Done | Removes private key from Keychain |
-| `--set-api-key` | Done | Stores Helius API key in Keychain |
-| `--clear-api-key` | Done | Removes API key from Keychain |
+| `--add-wallet` | Done | Imports a named wallet from `DEN_SECRET_KEY` |
+| `--add-watch` | Done | Adds a watch-only wallet |
+| `--list-wallets` | Done | Lists configured wallets |
+| `--switch-wallet` | Done | Sets active wallet |
+| `--rename-wallet` | Done | Renames a wallet |
+| `--remove-wallet` | Done | Removes a wallet |
+| `--import` | Done | Legacy import from `DEN_SECRET_KEY` |
+| `--clear` | Done | Removes private key from active or named wallet |
+| `--list-contacts` | Done | Lists contacts |
+| `--export-contacts` | Done | Exports contacts as JSON |
+| `--import-contacts` | Done | Imports contacts from JSON |
+| `--set-api-key` | Done | Stores Helius API key in config |
+| `--clear-api-key` | Done | Removes API key from config |
 | `--set-network` | Done | Persists default network to config |
-| `--config-path` | Done | Shows config file location |
-| `--status` | Done | Shows config/keychain state summary |
+| `--config-path` | Done | Shows active config location |
+| `--status` | Done | Shows full wallet/config summary |
 | `--help` | Done | |
 | `--balance` (headless query) | Not started | |
 
@@ -207,14 +229,14 @@ Wallet secrets are stored in macOS Keychain. Config can be local or centralized 
 
 ## Release
 
-Git tags that start with `v` trigger the release workflow in [release.yml](/Users/josh/Projects/_nothingdao/den/.github/workflows/release.yml). That workflow builds `den` tarballs for macOS targets and uploads SHA256 checksums alongside the release assets, which is the input Homebrew needs for a tap formula.
+Git tags that start with `v` trigger the release workflow in [release.yml](/Users/josh/Projects/_nothingdao/den/.github/workflows/release.yml). That workflow builds `den` tarballs for macOS targets and uploads the archives plus SHA256 checksum files directly to the GitHub release.
 
 The Homebrew formula itself should live in a separate tap repository, for example `nothingdao/homebrew-tap`. A starter formula is included at [den.rb.template](/Users/josh/Projects/_nothingdao/den/packaging/homebrew/den.rb.template).
 
 ### Homebrew Release Checklist
 
 1. Push the main branch to GitHub.
-2. Create and push a tag such as `v0.1.0`.
+2. Create and push a tag such as `v0.1.2`.
 3. Wait for [release.yml](/Users/josh/Projects/_nothingdao/den/.github/workflows/release.yml) to publish the macOS tarballs and `.sha256` files.
 4. Copy [den.rb.template](/Users/josh/Projects/_nothingdao/den/packaging/homebrew/den.rb.template) into `nothingdao/homebrew-tap` as `Formula/den.rb`.
 5. Replace `version` and both `sha256` placeholders in the formula with the values from the GitHub release assets.

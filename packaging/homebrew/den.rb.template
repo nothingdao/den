@@ -1,7 +1,7 @@
 class Den < Formula
   desc "Terminal wallet dashboard for Solana"
   homepage "https://github.com/nothingdao/den"
-  version "0.1.0"
+  version "0.1.2"
 
   on_macos do
     if Hardware::CPU.arm?
