@@ -56,8 +56,8 @@ jobs:
         with:
           name: den-${{ matrix.target }}
           path: |
-            den-${RELEASE_TAG}-${{ matrix.target }}.tar.gz
-            den-${RELEASE_TAG}-${{ matrix.target }}.tar.gz.sha256
+            den-${{ env.RELEASE_TAG }}-${{ matrix.target }}.tar.gz
+            den-${{ env.RELEASE_TAG }}-${{ matrix.target }}.tar.gz.sha256
 
   publish-release:
     name: Publish GitHub release
