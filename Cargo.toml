@@ -1,7 +1,18 @@
 [package]
-name = "tuis"
+name = "den-wallet"
 version = "0.1.0"
 edition = "2024"
+description = "Terminal wallet dashboard for Solana, built with Ratatui"
+license = "MIT"
+repository = "https://github.com/nothingdao/den"
+homepage = "https://github.com/nothingdao/den"
+readme = "README.md"
+keywords = ["tui", "solana", "wallet", "cli", "ratatui"]
+categories = ["command-line-utilities"]
+
+[[bin]]
+name = "den"
+path = "src/main.rs"
 
 [dependencies]
 ratatui = "0.29"
@@ -14,3 +25,4 @@ solana-sdk = "2"
 bs58 = "0.5"
 toml = "0.8"
 dirs = "6"
+chrono = "0.4"

@@ -2,6 +2,25 @@
 
 Terminal wallet dashboard for Solana, built with Ratatui. It can show live balances and recent activity via Helius, or run in a placeholder mode when no credentials are set.
 
+## Install
+
+Install via Homebrew:
+```bash
+brew install nothingdao/tap/den
+den
+```
+
+Build and run locally during development:
+```bash
+cargo run
+```
+
+Install the CLI from source:
+```bash
+cargo install --path .
+den
+```
+
 ## Features
 - Multi-tab wallet overview (accounts, tokens, history, address book, settings)
 - Live balance + token fetch from Helius RPC
@@ -15,46 +34,57 @@ Terminal wallet dashboard for Solana, built with Ratatui. It can show live balan
 
 ## Quick Start
 ```bash
-cargo run
+den
 ```
 
 ## Setup
 
 Store your Helius API key (required for live data):
 ```bash
-cargo run -- --set-api-key YOUR_HELIUS_KEY
+den --set-api-key YOUR_HELIUS_KEY
 ```
 
 Import a wallet key (base58 from Phantom, or JSON byte array from Solana CLI):
 ```bash
-cargo run -- --import  # reads DEN_SECRET_KEY env var
+den --import  # reads DEN_SECRET_KEY env var
 ```
 
 Or import interactively: launch the TUI and press `i` to paste a key.
 
 Check current status:
 ```bash
-cargo run -- --status
+den --status
 ```
+
+If you have not installed the binary yet, prefix the same commands with `cargo run --`.
 
 ## Configuration
 
-Secrets are stored in macOS Keychain. Preferences are stored in a config file created automatically on first run:
+Wallet secrets are stored in macOS Keychain. Config can be local or centralized in Bitwarden.
 
 | Storage | Location | Contents |
 |---------|----------|----------|
-| Keychain | `den-wallet` service | Private key, Helius API key |
-| Config file | `~/.config/den/config.toml` (or `~/Library/Application Support/den/config.toml` on macOS) | Default network, wallet address, theme |
-| Env vars | Shell environment | `HELIUS_API_KEY`, `WALLET_ADDRESS` (override keychain/config) |
+| Keychain | `den-wallet` service | Wallet private keys |
+| Config file | `~/.config/den/config.toml` (or `~/Library/Application Support/den/config.toml` on macOS) | Local config backend |
+| Bitwarden item | `DEN_BW_CONFIG_ITEM_ID` | Centralized config backend |
+| Env vars | Shell environment | `HELIUS_API_KEY`, `DEN_CONFIG_BACKEND`, `DEN_BW_CONFIG_ITEM_ID` |
+
+### Onboarding (TUI)
+- On first launch, the app opens a setup wizard in the TUI and blocks normal actions until setup is complete.
+- Choose `This Mac` for local config, or `Bitwarden` for synced config.
+- Bitwarden mode includes guided actions: check status, API key login, unlock, then enter config item ID.
+- The app initializes default config in the selected Bitwarden item when notes are empty/invalid.
+- Press `o` on the Settings tab to run the setup wizard again.
 
 ### CLI Commands
 ```
 --import           Store key from DEN_SECRET_KEY in Keychain
 --clear            Remove private key from Keychain
---set-api-key KEY  Store Helius API key in Keychain
---clear-api-key    Remove API key from Keychain
+--set-api-key KEY  Store Helius API key in config
+--clear-api-key    Remove API key from config
 --set-network NET  Set default network (mainnet|devnet)
---config-path      Show config file location
+--migrate-config-to-bitwarden [--force]  Copy local config to Bitwarden
+--config-path      Show active config location
 --status           Show current configuration status
 --help             Show all commands
 ```
@@ -174,3 +204,18 @@ Secrets are stored in macOS Keychain. Preferences are stored in a config file cr
 
 ## Notes
 - If `WALLET_ADDRESS` is not set, the app attempts to derive it from Keychain.
+
+## Release
+
+Git tags that start with `v` trigger the release workflow in [release.yml](/Users/josh/Projects/_nothingdao/den/.github/workflows/release.yml). That workflow builds `den` tarballs for macOS targets and uploads SHA256 checksums alongside the release assets, which is the input Homebrew needs for a tap formula.
+
+The Homebrew formula itself should live in a separate tap repository, for example `nothingdao/homebrew-tap`. A starter formula is included at [den.rb.template](/Users/josh/Projects/_nothingdao/den/packaging/homebrew/den.rb.template).
+
+### Homebrew Release Checklist
+
+1. Push the main branch to GitHub.
+2. Create and push a tag such as `v0.1.0`.
+3. Wait for [release.yml](/Users/josh/Projects/_nothingdao/den/.github/workflows/release.yml) to publish the macOS tarballs and `.sha256` files.
+4. Copy [den.rb.template](/Users/josh/Projects/_nothingdao/den/packaging/homebrew/den.rb.template) into `nothingdao/homebrew-tap` as `Formula/den.rb`.
+5. Replace `version` and both `sha256` placeholders in the formula with the values from the GitHub release assets.
+6. Test locally with `brew install nothingdao/tap/den`.
