@@ -30,6 +30,10 @@ brew install nothingdao/tap/den
 den
 ```
 
+## Theme
+
+Colors are loaded from `~/.config/den/theme.toml` at startup via `init_den_theme()` and hot-reloaded on file change (~250ms detection via mtime in the main loop). The global theme is stored in `thread_local! { Cell<Option<DenTheme>> }`. Theme fields: `bg`, `fg`, `accent`, `sel_fg`, `fg_dim`, `fg_xdim`, `border`, `surface`, `green`, `red`, `yellow`. Edit `~/.config/den/theme.toml` directly and the running TUI updates without restart. Den intentionally has its own theme, separate from the whaleen dotfiles palette.
+
 ## Key Files
 
 ```text

@@ -1,8 +1,11 @@
 use std::error::Error;
+use std::fs;
 use std::io::{self, Write};
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
+use std::cell::Cell;
 use std::sync::{Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use crossterm::execute;
@@ -14,7 +17,8 @@ use ratatui::prelude::{Backend, CrosstermBackend, Terminal};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{
-    Axis, Block, Borders, Chart, Dataset, GraphType, List, ListItem, Paragraph, Row, Table, Tabs,
+    Axis, Block, BorderType, Borders, Chart, Dataset, GraphType, List, ListItem, Paragraph, Row,
+    Table, Tabs,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -34,13 +38,137 @@ const BW_CONFIG_ITEM_ID_ENV: &str = "DEN_BW_CONFIG_ITEM_ID";
 static CONFIG_REV: OnceLock<Mutex<Option<String>>> = OnceLock::new();
 static BW_SESSION_CACHE: OnceLock<Mutex<Option<String>>> = OnceLock::new();
 
-const COLOR_BARK: Color = Color::Rgb(58, 46, 42);
-const COLOR_FAWN: Color = Color::Rgb(199, 181, 154);
-const COLOR_ASH: Color = Color::Rgb(232, 225, 215);
-const COLOR_SOOT: Color = Color::Rgb(16, 16, 16);
-const COLOR_STONE: Color = Color::Rgb(118, 111, 102);
-const COLOR_MOSS: Color = Color::Rgb(78, 104, 82);
-const COLOR_EMBER: Color = Color::Rgb(179, 106, 78);
+// ── Theme ─────────────────────────────────────────────────────────────────────
+
+const THEME_FILE_NAME: &str = "theme.toml";
+
+#[derive(serde::Deserialize)]
+struct DenThemeConfig {
+    #[serde(default = "den_default_bg")]      bg:      String,
+    #[serde(default = "den_default_fg")]      fg:      String,
+    #[serde(default = "den_default_accent")]  accent:  String,
+    #[serde(default = "den_default_sel_fg")]  sel_fg:  String,
+    #[serde(default = "den_default_fg_dim")]  fg_dim:  String,
+    #[serde(default = "den_default_fg_xdim")] fg_xdim: String,
+    #[serde(default = "den_default_border")]  border:  String,
+    #[serde(default = "den_default_surface")] surface: String,
+    #[serde(default = "den_default_green")]   green:   String,
+    #[serde(default = "den_default_red")]     red:     String,
+    #[serde(default = "den_default_yellow")]  yellow:  String,
+}
+
+fn den_default_bg()      -> String { "#101010".into() }
+fn den_default_fg()      -> String { "#ffffff".into() }
+fn den_default_accent()  -> String { "#e8b887".into() }
+fn den_default_sel_fg()  -> String { "#101010".into() }
+fn den_default_fg_dim()  -> String { "#A0A0A0".into() }
+fn den_default_fg_xdim() -> String { "#7E7E7E".into() }
+fn den_default_border()  -> String { "#232323".into() }
+fn den_default_surface() -> String { "#1C1C1C".into() }
+fn den_default_green()   -> String { "#90b99f".into() }
+fn den_default_red()     -> String { "#f5a191".into() }
+fn den_default_yellow()  -> String { "#e6b99d".into() }
+
+#[derive(serde::Deserialize)]
+struct DenThemeFile {
+    #[serde(default)]
+    theme: DenThemeConfig,
+}
+
+impl Default for DenThemeFile {
+    fn default() -> Self { Self { theme: DenThemeConfig::default() } }
+}
+
+impl Default for DenThemeConfig {
+    fn default() -> Self {
+        Self {
+            bg:      den_default_bg(),
+            fg:      den_default_fg(),
+            accent:  den_default_accent(),
+            sel_fg:  den_default_sel_fg(),
+            fg_dim:  den_default_fg_dim(),
+            fg_xdim: den_default_fg_xdim(),
+            border:  den_default_border(),
+            surface: den_default_surface(),
+            green:   den_default_green(),
+            red:     den_default_red(),
+            yellow:  den_default_yellow(),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct DenTheme {
+    bg: Color, fg: Color, accent: Color, sel_fg: Color,
+    fg_dim: Color, fg_xdim: Color, border: Color, surface: Color,
+    green: Color, red: Color, yellow: Color,
+}
+
+thread_local! {
+    static DEN_THEME: Cell<Option<DenTheme>> = Cell::new(None);
+}
+
+fn theme() -> DenTheme {
+    DEN_THEME.with(|c| c.get().unwrap_or_else(default_den_theme))
+}
+
+fn default_den_theme() -> DenTheme {
+    den_theme_from_config(&DenThemeConfig::default())
+}
+
+fn den_theme_from_config(cfg: &DenThemeConfig) -> DenTheme {
+    DenTheme {
+        bg:      den_hex_color(&cfg.bg),
+        fg:      den_hex_color(&cfg.fg),
+        accent:  den_hex_color(&cfg.accent),
+        sel_fg:  den_hex_color(&cfg.sel_fg),
+        fg_dim:  den_hex_color(&cfg.fg_dim),
+        fg_xdim: den_hex_color(&cfg.fg_xdim),
+        border:  den_hex_color(&cfg.border),
+        surface: den_hex_color(&cfg.surface),
+        green:   den_hex_color(&cfg.green),
+        red:     den_hex_color(&cfg.red),
+        yellow:  den_hex_color(&cfg.yellow),
+    }
+}
+
+fn den_hex_color(hex: &str) -> Color {
+    let h = hex.trim_start_matches('#');
+    let r = u8::from_str_radix(&h[0..2], 16).unwrap_or(255);
+    let g = u8::from_str_radix(&h[2..4], 16).unwrap_or(255);
+    let b = u8::from_str_radix(&h[4..6], 16).unwrap_or(255);
+    Color::Rgb(r, g, b)
+}
+
+fn den_theme_path() -> Option<PathBuf> {
+    dirs::config_dir().map(|d| d.join(CONFIG_DIR_NAME).join(THEME_FILE_NAME))
+}
+
+fn init_den_theme() {
+    if let Some(path) = den_theme_path() {
+        if let Ok(s) = fs::read_to_string(&path) {
+            if let Ok(file) = toml::from_str::<DenThemeFile>(&s) {
+                DEN_THEME.with(|c| c.set(Some(den_theme_from_config(&file.theme))));
+                return;
+            }
+        }
+    }
+    DEN_THEME.with(|c| c.set(Some(default_den_theme())));
+}
+
+fn reload_den_theme_if_changed(mtime: &mut Option<SystemTime>) {
+    let Some(path) = den_theme_path() else { return };
+    let Ok(meta) = fs::metadata(&path) else { return };
+    let Ok(modified) = meta.modified() else { return };
+    if mtime.map_or(true, |last| modified > last) {
+        *mtime = Some(modified);
+        if let Ok(s) = fs::read_to_string(&path) {
+            if let Ok(file) = toml::from_str::<DenThemeFile>(&s) {
+                DEN_THEME.with(|c| c.set(Some(den_theme_from_config(&file.theme))));
+            }
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Tab {
@@ -900,6 +1028,7 @@ struct App {
     contact_detail_index: Option<usize>,
     last_signature: String,
     onboarding: OnboardingState,
+    theme_mtime: Option<SystemTime>,
 }
 
 impl App {
@@ -948,6 +1077,7 @@ impl App {
                 message: String::new(),
                 bw_client_id: String::new(),
             },
+            theme_mtime: None,
         }
     }
 
@@ -1640,6 +1770,7 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>) -> Result<(), Box<dyn Error>>
     let tick_rate = Duration::from_millis(250);
 
     while !app.should_quit {
+        reload_den_theme_if_changed(&mut app.theme_mtime);
         terminal.draw(|frame| ui(frame, &app))?;
 
         if event::poll(tick_rate)? {
@@ -1656,6 +1787,7 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>) -> Result<(), Box<dyn Error>>
 
 fn build_app() -> App {
     ensure_config_exists();
+    init_den_theme();
     let mut den_config = load_den_config();
     let needs_onboarding = should_start_onboarding();
 
@@ -1685,6 +1817,14 @@ fn build_app() -> App {
     refresh_wallet_data(&mut app);
 
     app
+}
+
+fn bordered<'a>(title: &'a str) -> Block<'a> {
+    Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(theme().border))
+        .title(title)
 }
 
 fn ui(frame: &mut ratatui::prelude::Frame, app: &App) {
@@ -1734,37 +1874,37 @@ fn render_header(
             .block(
                 Block::default()
                     .borders(Borders::ALL)
-                    .border_style(Style::default().fg(COLOR_BARK)),
+                    .border_style(Style::default().fg(theme().border)),
             )
-            .style(Style::default().fg(COLOR_ASH));
+            .style(Style::default().fg(theme().fg));
         frame.render_widget(header, area);
         return;
     }
 
     let titles = Tab::ALL
         .iter()
-        .map(|t| Line::from(Span::styled(t.title(), Style::default().fg(COLOR_ASH))))
+        .map(|t| Line::from(Span::styled(t.title(), Style::default().fg(theme().fg))))
         .collect::<Vec<_>>();
 
     let tabs = Tabs::new(titles)
         .select(tab.index())
         .highlight_style(
             Style::default()
-                .fg(COLOR_SOOT)
-                .bg(COLOR_FAWN)
+                .fg(theme().sel_fg)
+                .bg(theme().accent)
                 .add_modifier(Modifier::BOLD),
         )
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(COLOR_BARK))
+                .border_style(Style::default().fg(theme().border))
                 .title(format!(
                     "Den Wallet | {} | {}",
                     tab.title(),
                     network.label()
                 )),
         )
-        .style(Style::default().fg(COLOR_ASH));
+        .style(Style::default().fg(theme().fg));
 
     frame.render_widget(tabs, area);
 }
@@ -1798,17 +1938,17 @@ fn render_sidebar(frame: &mut ratatui::prelude::Frame, area: Rect, tab: Tab) {
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(COLOR_BARK))
+                .border_style(Style::default().fg(theme().border))
                 .title("Sections (1-8)"),
         )
         .highlight_style(
             Style::default()
-                .fg(COLOR_SOOT)
-                .bg(COLOR_FAWN)
+                .fg(theme().sel_fg)
+                .bg(theme().accent)
                 .add_modifier(Modifier::BOLD),
         )
         .highlight_symbol("> ")
-        .style(Style::default().fg(COLOR_ASH));
+        .style(Style::default().fg(theme().fg));
 
     frame.render_stateful_widget(list, area, &mut list_state(tab.index()));
 }
@@ -1862,10 +2002,10 @@ fn render_overview(frame: &mut ratatui::prelude::Frame, area: Rect, app: &App, w
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(COLOR_BARK))
+                .border_style(Style::default().fg(theme().border))
                 .title("Overview"),
         )
-        .style(Style::default().fg(COLOR_ASH));
+        .style(Style::default().fg(theme().fg));
 
     frame.render_widget(paragraph, layout[0]);
 
@@ -1915,21 +2055,21 @@ fn render_accounts(frame: &mut ratatui::prelude::Frame, area: Rect, app: &App) {
     .header(
         Row::new(vec!["Name", "Address", "Balance", "Type"]).style(
             Style::default()
-                .fg(COLOR_FAWN)
-                .bg(COLOR_BARK)
+                .fg(theme().accent)
+                .bg(theme().surface)
                 .add_modifier(Modifier::BOLD),
         ),
     )
     .block(
         Block::default()
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(COLOR_BARK))
+            .border_style(Style::default().fg(theme().border))
             .title("Wallets [Enter:details a:add w:watch e:rename d:delete]"),
     )
     .row_highlight_style(
         Style::default()
-            .fg(COLOR_SOOT)
-            .bg(COLOR_FAWN)
+            .fg(theme().sel_fg)
+            .bg(theme().accent)
             .add_modifier(Modifier::BOLD),
     )
     .highlight_symbol("> ");
@@ -1950,10 +2090,10 @@ fn render_wallet_detail(
                 .block(
                     Block::default()
                         .borders(Borders::ALL)
-                        .border_style(Style::default().fg(COLOR_BARK))
+                        .border_style(Style::default().fg(theme().border))
                         .title("Wallet Detail"),
                 )
-                .style(Style::default().fg(COLOR_EMBER));
+                .style(Style::default().fg(theme().accent));
             frame.render_widget(msg, area);
             return;
         }
@@ -1981,40 +2121,40 @@ fn render_wallet_detail(
 
     let info = Text::from(vec![
         Line::from(vec![
-            Span::styled("  Name:     ", Style::default().fg(COLOR_STONE)),
-            Span::styled(&account.name, Style::default().fg(COLOR_ASH)),
+            Span::styled("  Name:     ", Style::default().fg(theme().fg_dim)),
+            Span::styled(&account.name, Style::default().fg(theme().fg)),
         ]),
         Line::from(""),
         Line::from(vec![
-            Span::styled("  Address:  ", Style::default().fg(COLOR_STONE)),
-            Span::styled(&account.address, Style::default().fg(COLOR_ASH)),
+            Span::styled("  Address:  ", Style::default().fg(theme().fg_dim)),
+            Span::styled(&account.address, Style::default().fg(theme().fg)),
         ]),
         Line::from(""),
         Line::from(vec![
-            Span::styled("  Balance:  ", Style::default().fg(COLOR_STONE)),
-            Span::styled(&account.balance, Style::default().fg(COLOR_ASH)),
+            Span::styled("  Balance:  ", Style::default().fg(theme().fg_dim)),
+            Span::styled(&account.balance, Style::default().fg(theme().fg)),
         ]),
         Line::from(""),
         Line::from(vec![
-            Span::styled("  Type:     ", Style::default().fg(COLOR_STONE)),
-            Span::styled(wallet_type, Style::default().fg(COLOR_ASH)),
+            Span::styled("  Type:     ", Style::default().fg(theme().fg_dim)),
+            Span::styled(wallet_type, Style::default().fg(theme().fg)),
         ]),
         Line::from(""),
         Line::from(vec![
-            Span::styled("  Active:   ", Style::default().fg(COLOR_STONE)),
+            Span::styled("  Active:   ", Style::default().fg(theme().fg_dim)),
             Span::styled(
                 active_status,
                 Style::default().fg(if account.is_active {
-                    COLOR_MOSS
+                    theme().green
                 } else {
-                    COLOR_STONE
+                    theme().fg_dim
                 }),
             ),
         ]),
         Line::from(""),
         Line::from(vec![
-            Span::styled("  Added:    ", Style::default().fg(COLOR_STONE)),
-            Span::styled(added_display, Style::default().fg(COLOR_ASH)),
+            Span::styled("  Added:    ", Style::default().fg(theme().fg_dim)),
+            Span::styled(added_display, Style::default().fg(theme().fg)),
         ]),
     ]);
 
@@ -2022,30 +2162,30 @@ fn render_wallet_detail(
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(COLOR_BARK))
+                .border_style(Style::default().fg(theme().border))
                 .title(format!("Wallet: {}", account.name)),
         )
-        .style(Style::default().fg(COLOR_ASH));
+        .style(Style::default().fg(theme().fg));
 
     frame.render_widget(paragraph, layout[0]);
 
     let hints = Text::from(vec![
         Line::from(""),
         Line::from(vec![
-            Span::styled("  Enter", Style::default().fg(COLOR_FAWN).add_modifier(Modifier::BOLD)),
-            Span::styled("  Set as active wallet", Style::default().fg(COLOR_ASH)),
+            Span::styled("  Enter", Style::default().fg(theme().accent).add_modifier(Modifier::BOLD)),
+            Span::styled("  Set as active wallet", Style::default().fg(theme().fg)),
         ]),
         Line::from(vec![
-            Span::styled("  e", Style::default().fg(COLOR_FAWN).add_modifier(Modifier::BOLD)),
-            Span::styled("      Rename wallet", Style::default().fg(COLOR_ASH)),
+            Span::styled("  e", Style::default().fg(theme().accent).add_modifier(Modifier::BOLD)),
+            Span::styled("      Rename wallet", Style::default().fg(theme().fg)),
         ]),
         Line::from(vec![
-            Span::styled("  d", Style::default().fg(COLOR_FAWN).add_modifier(Modifier::BOLD)),
-            Span::styled("      Delete wallet", Style::default().fg(COLOR_ASH)),
+            Span::styled("  d", Style::default().fg(theme().accent).add_modifier(Modifier::BOLD)),
+            Span::styled("      Delete wallet", Style::default().fg(theme().fg)),
         ]),
         Line::from(vec![
-            Span::styled("  Esc", Style::default().fg(COLOR_FAWN).add_modifier(Modifier::BOLD)),
-            Span::styled("    Back to wallet list", Style::default().fg(COLOR_ASH)),
+            Span::styled("  Esc", Style::default().fg(theme().accent).add_modifier(Modifier::BOLD)),
+            Span::styled("    Back to wallet list", Style::default().fg(theme().fg)),
         ]),
     ]);
 
@@ -2053,10 +2193,10 @@ fn render_wallet_detail(
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(COLOR_BARK))
+                .border_style(Style::default().fg(theme().border))
                 .title("Actions"),
         )
-        .style(Style::default().fg(COLOR_ASH));
+        .style(Style::default().fg(theme().fg));
 
     frame.render_widget(actions, layout[1]);
 }
@@ -2100,21 +2240,21 @@ fn render_tokens_table(frame: &mut ratatui::prelude::Frame, area: Rect, app: &Ap
     .header(
         Row::new(vec!["Token", "Balance", "Value"]).style(
             Style::default()
-                .fg(COLOR_FAWN)
-                .bg(COLOR_BARK)
+                .fg(theme().accent)
+                .bg(theme().surface)
                 .add_modifier(Modifier::BOLD),
         ),
     )
     .block(
         Block::default()
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(COLOR_BARK))
+            .border_style(Style::default().fg(theme().border))
             .title("Tokens"),
     )
     .row_highlight_style(
         Style::default()
-            .fg(COLOR_SOOT)
-            .bg(COLOR_FAWN)
+            .fg(theme().sel_fg)
+            .bg(theme().accent)
             .add_modifier(Modifier::BOLD),
     )
     .highlight_symbol("> ");
@@ -2145,34 +2285,34 @@ fn render_token_chart(frame: &mut ratatui::prelude::Frame, area: Rect, app: &App
         .name("price")
         .marker(ratatui::symbols::Marker::Dot)
         .graph_type(GraphType::Line)
-        .style(Style::default().fg(COLOR_FAWN))
+        .style(Style::default().fg(theme().accent))
         .data(&data);
 
     let chart = Chart::new(vec![dataset])
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(COLOR_BARK))
+                .border_style(Style::default().fg(theme().border))
                 .title(title),
         )
         .x_axis(
             Axis::default()
                 .title("time")
-                .style(Style::default().fg(COLOR_STONE))
+                .style(Style::default().fg(theme().fg_dim))
                 .bounds([0.0, x_max])
                 .labels([
-                    Span::styled("24h", Style::default().fg(COLOR_STONE)),
-                    Span::styled("now", Style::default().fg(COLOR_STONE)),
+                    Span::styled("24h", Style::default().fg(theme().fg_dim)),
+                    Span::styled("now", Style::default().fg(theme().fg_dim)),
                 ]),
         )
         .y_axis(
             Axis::default()
                 .title("price")
-                .style(Style::default().fg(COLOR_STONE))
+                .style(Style::default().fg(theme().fg_dim))
                 .bounds([min, max])
                 .labels([
-                    Span::styled(format!("{:.2}", min), Style::default().fg(COLOR_STONE)),
-                    Span::styled(format!("{:.2}", max), Style::default().fg(COLOR_STONE)),
+                    Span::styled(format!("{:.2}", min), Style::default().fg(theme().fg_dim)),
+                    Span::styled(format!("{:.2}", max), Style::default().fg(theme().fg_dim)),
                 ]),
         );
 
@@ -2199,17 +2339,17 @@ fn render_history_list(frame: &mut ratatui::prelude::Frame, area: Rect, app: &Ap
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(COLOR_BARK))
+                .border_style(Style::default().fg(theme().border))
                 .title("Recent Activity"),
         )
         .highlight_style(
             Style::default()
-                .fg(COLOR_SOOT)
-                .bg(COLOR_FAWN)
+                .fg(theme().sel_fg)
+                .bg(theme().accent)
                 .add_modifier(Modifier::BOLD),
         )
         .highlight_symbol("> ")
-        .style(Style::default().fg(COLOR_ASH));
+        .style(Style::default().fg(theme().fg));
 
     frame.render_stateful_widget(list, area, &mut list_state(app.selected_history));
 }
@@ -2238,17 +2378,17 @@ fn render_address_book(frame: &mut ratatui::prelude::Frame, area: Rect, app: &Ap
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(COLOR_BARK))
+                .border_style(Style::default().fg(theme().border))
                 .title("Address Book [Enter:details a:add e:edit d:delete]"),
         )
         .highlight_style(
             Style::default()
-                .fg(COLOR_SOOT)
-                .bg(COLOR_FAWN)
+                .fg(theme().sel_fg)
+                .bg(theme().accent)
                 .add_modifier(Modifier::BOLD),
         )
         .highlight_symbol("> ")
-        .style(Style::default().fg(COLOR_ASH));
+        .style(Style::default().fg(theme().fg));
 
     frame.render_stateful_widget(list, area, &mut list_state(app.selected_contact));
 }
@@ -2266,10 +2406,10 @@ fn render_contact_detail(
                 .block(
                     Block::default()
                         .borders(Borders::ALL)
-                        .border_style(Style::default().fg(COLOR_BARK))
+                        .border_style(Style::default().fg(theme().border))
                         .title("Contact Detail"),
                 )
-                .style(Style::default().fg(COLOR_EMBER));
+                .style(Style::default().fg(theme().accent));
             frame.render_widget(msg, area);
             return;
         }
@@ -2288,23 +2428,23 @@ fn render_contact_detail(
 
     let info = Text::from(vec![
         Line::from(vec![
-            Span::styled("  Name:     ", Style::default().fg(COLOR_STONE)),
-            Span::styled(&contact.name, Style::default().fg(COLOR_ASH)),
+            Span::styled("  Name:     ", Style::default().fg(theme().fg_dim)),
+            Span::styled(&contact.name, Style::default().fg(theme().fg)),
         ]),
         Line::from(""),
         Line::from(vec![
-            Span::styled("  Address:  ", Style::default().fg(COLOR_STONE)),
-            Span::styled(&contact.address, Style::default().fg(COLOR_ASH)),
+            Span::styled("  Address:  ", Style::default().fg(theme().fg_dim)),
+            Span::styled(&contact.address, Style::default().fg(theme().fg)),
         ]),
         Line::from(""),
         Line::from(vec![
-            Span::styled("  Network:  ", Style::default().fg(COLOR_STONE)),
-            Span::styled(&contact.network, Style::default().fg(COLOR_ASH)),
+            Span::styled("  Network:  ", Style::default().fg(theme().fg_dim)),
+            Span::styled(&contact.network, Style::default().fg(theme().fg)),
         ]),
         Line::from(""),
         Line::from(vec![
-            Span::styled("  Notes:    ", Style::default().fg(COLOR_STONE)),
-            Span::styled(notes_display, Style::default().fg(COLOR_ASH)),
+            Span::styled("  Notes:    ", Style::default().fg(theme().fg_dim)),
+            Span::styled(notes_display, Style::default().fg(theme().fg)),
         ]),
     ]);
 
@@ -2312,34 +2452,34 @@ fn render_contact_detail(
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(COLOR_BARK))
+                .border_style(Style::default().fg(theme().border))
                 .title(format!("Contact: {}", contact.name)),
         )
-        .style(Style::default().fg(COLOR_ASH));
+        .style(Style::default().fg(theme().fg));
 
     frame.render_widget(paragraph, layout[0]);
 
     let hints = Text::from(vec![
         Line::from(""),
         Line::from(vec![
-            Span::styled("  e", Style::default().fg(COLOR_FAWN).add_modifier(Modifier::BOLD)),
-            Span::styled("      Edit name", Style::default().fg(COLOR_ASH)),
+            Span::styled("  e", Style::default().fg(theme().accent).add_modifier(Modifier::BOLD)),
+            Span::styled("      Edit name", Style::default().fg(theme().fg)),
         ]),
         Line::from(vec![
-            Span::styled("  a", Style::default().fg(COLOR_FAWN).add_modifier(Modifier::BOLD)),
-            Span::styled("      Edit address", Style::default().fg(COLOR_ASH)),
+            Span::styled("  a", Style::default().fg(theme().accent).add_modifier(Modifier::BOLD)),
+            Span::styled("      Edit address", Style::default().fg(theme().fg)),
         ]),
         Line::from(vec![
-            Span::styled("  o", Style::default().fg(COLOR_FAWN).add_modifier(Modifier::BOLD)),
-            Span::styled("      Edit notes", Style::default().fg(COLOR_ASH)),
+            Span::styled("  o", Style::default().fg(theme().accent).add_modifier(Modifier::BOLD)),
+            Span::styled("      Edit notes", Style::default().fg(theme().fg)),
         ]),
         Line::from(vec![
-            Span::styled("  d", Style::default().fg(COLOR_FAWN).add_modifier(Modifier::BOLD)),
-            Span::styled("      Delete contact", Style::default().fg(COLOR_ASH)),
+            Span::styled("  d", Style::default().fg(theme().accent).add_modifier(Modifier::BOLD)),
+            Span::styled("      Delete contact", Style::default().fg(theme().fg)),
         ]),
         Line::from(vec![
-            Span::styled("  Esc", Style::default().fg(COLOR_FAWN).add_modifier(Modifier::BOLD)),
-            Span::styled("    Back to contact list", Style::default().fg(COLOR_ASH)),
+            Span::styled("  Esc", Style::default().fg(theme().accent).add_modifier(Modifier::BOLD)),
+            Span::styled("    Back to contact list", Style::default().fg(theme().fg)),
         ]),
     ]);
 
@@ -2347,10 +2487,10 @@ fn render_contact_detail(
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(COLOR_BARK))
+                .border_style(Style::default().fg(theme().border))
                 .title("Actions"),
         )
-        .style(Style::default().fg(COLOR_ASH));
+        .style(Style::default().fg(theme().fg));
 
     frame.render_widget(actions, layout[1]);
 }
@@ -2365,10 +2505,10 @@ fn render_send(frame: &mut ratatui::prelude::Frame, area: Rect, app: &App) {
             .block(
                 Block::default()
                     .borders(Borders::ALL)
-                    .border_style(Style::default().fg(COLOR_BARK))
+                    .border_style(Style::default().fg(theme().border))
                     .title("Send"),
             )
-            .style(Style::default().fg(COLOR_EMBER));
+            .style(Style::default().fg(theme().accent));
             frame.render_widget(notice, area);
             return;
         }
@@ -2403,20 +2543,20 @@ fn render_send(frame: &mut ratatui::prelude::Frame, area: Rect, app: &App) {
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(COLOR_BARK))
+                .border_style(Style::default().fg(theme().border))
                 .title("Actions"),
         )
-        .style(Style::default().fg(COLOR_ASH));
+        .style(Style::default().fg(theme().fg));
 
     frame.render_widget(
         Paragraph::new(fields)
             .block(
                 Block::default()
                     .borders(Borders::ALL)
-                    .border_style(Style::default().fg(COLOR_BARK))
+                    .border_style(Style::default().fg(theme().border))
                     .title("Send"),
             )
-            .style(Style::default().fg(COLOR_ASH)),
+            .style(Style::default().fg(theme().fg)),
         layout[0],
     );
     frame.render_widget(
@@ -2424,10 +2564,10 @@ fn render_send(frame: &mut ratatui::prelude::Frame, area: Rect, app: &App) {
             .block(
                 Block::default()
                     .borders(Borders::ALL)
-                    .border_style(Style::default().fg(COLOR_BARK))
+                    .border_style(Style::default().fg(theme().border))
                     .title("Details"),
             )
-            .style(Style::default().fg(COLOR_ASH)),
+            .style(Style::default().fg(theme().fg)),
         layout[1],
     );
     frame.render_widget(actions, layout[2]);
@@ -2448,10 +2588,10 @@ fn render_receive(frame: &mut ratatui::prelude::Frame, area: Rect, app: &App) {
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(COLOR_BARK))
+                .border_style(Style::default().fg(theme().border))
                 .title("Receive"),
         )
-        .style(Style::default().fg(COLOR_ASH));
+        .style(Style::default().fg(theme().fg));
 
     frame.render_widget(paragraph, area);
 }
@@ -2478,70 +2618,70 @@ fn render_settings(frame: &mut ratatui::prelude::Frame, area: Rect, app: &App) {
 
     let network_section = Text::from(vec![
         Line::from(vec![
-            Span::styled("  Network:    ", Style::default().fg(COLOR_STONE)),
-            Span::styled(app.network.label(), Style::default().fg(COLOR_ASH)),
-            Span::styled("  (n to toggle)", Style::default().fg(COLOR_STONE)),
+            Span::styled("  Network:    ", Style::default().fg(theme().fg_dim)),
+            Span::styled(app.network.label(), Style::default().fg(theme().fg)),
+            Span::styled("  (n to toggle)", Style::default().fg(theme().fg_dim)),
         ]),
         Line::from(vec![
-            Span::styled("  Default:    ", Style::default().fg(COLOR_STONE)),
-            Span::styled(&app.default_network, Style::default().fg(COLOR_ASH)),
+            Span::styled("  Default:    ", Style::default().fg(theme().fg_dim)),
+            Span::styled(&app.default_network, Style::default().fg(theme().fg)),
         ]),
         Line::from(vec![
-            Span::styled("  API Key:    ", Style::default().fg(COLOR_STONE)),
-            Span::styled(&app.api_key_status, Style::default().fg(COLOR_ASH)),
+            Span::styled("  API Key:    ", Style::default().fg(theme().fg_dim)),
+            Span::styled(&app.api_key_status, Style::default().fg(theme().fg)),
         ]),
         Line::from(vec![
-            Span::styled("  Config:     ", Style::default().fg(COLOR_STONE)),
-            Span::styled(&app.config_path_display, Style::default().fg(COLOR_ASH)),
+            Span::styled("  Config:     ", Style::default().fg(theme().fg_dim)),
+            Span::styled(&app.config_path_display, Style::default().fg(theme().fg)),
         ]),
     ]);
 
     let wallet_section = Text::from(vec![
         Line::from(vec![
-            Span::styled("  Active:     ", Style::default().fg(COLOR_STONE)),
-            Span::styled(active_name, Style::default().fg(COLOR_ASH)),
+            Span::styled("  Active:     ", Style::default().fg(theme().fg_dim)),
+            Span::styled(active_name, Style::default().fg(theme().fg)),
         ]),
         Line::from(vec![
-            Span::styled("  Address:    ", Style::default().fg(COLOR_STONE)),
-            Span::styled(&app.wallet_address, Style::default().fg(COLOR_ASH)),
+            Span::styled("  Address:    ", Style::default().fg(theme().fg_dim)),
+            Span::styled(&app.wallet_address, Style::default().fg(theme().fg)),
         ]),
         Line::from(vec![
-            Span::styled("  Wallets:    ", Style::default().fg(COLOR_STONE)),
+            Span::styled("  Wallets:    ", Style::default().fg(theme().fg_dim)),
             Span::styled(
                 format!("{} total ({} full, {} watch-only)", wallet_count, full_count, watch_count),
-                Style::default().fg(COLOR_ASH),
+                Style::default().fg(theme().fg),
             ),
         ]),
         Line::from(vec![
-            Span::styled("  Last sig:   ", Style::default().fg(COLOR_STONE)),
-            Span::styled(&app.last_signature, Style::default().fg(COLOR_ASH)),
+            Span::styled("  Last sig:   ", Style::default().fg(theme().fg_dim)),
+            Span::styled(&app.last_signature, Style::default().fg(theme().fg)),
         ]),
     ]);
 
     let shortcuts = Text::from(vec![
         Line::from(vec![
-            Span::styled("  n", Style::default().fg(COLOR_FAWN).add_modifier(Modifier::BOLD)),
-            Span::styled("  Toggle network", Style::default().fg(COLOR_ASH)),
+            Span::styled("  n", Style::default().fg(theme().accent).add_modifier(Modifier::BOLD)),
+            Span::styled("  Toggle network", Style::default().fg(theme().fg)),
         ]),
         Line::from(vec![
-            Span::styled("  r", Style::default().fg(COLOR_FAWN).add_modifier(Modifier::BOLD)),
-            Span::styled("  Refresh data", Style::default().fg(COLOR_ASH)),
+            Span::styled("  r", Style::default().fg(theme().accent).add_modifier(Modifier::BOLD)),
+            Span::styled("  Refresh data", Style::default().fg(theme().fg)),
         ]),
         Line::from(vec![
-            Span::styled("  i", Style::default().fg(COLOR_FAWN).add_modifier(Modifier::BOLD)),
-            Span::styled("  Import wallet", Style::default().fg(COLOR_ASH)),
+            Span::styled("  i", Style::default().fg(theme().accent).add_modifier(Modifier::BOLD)),
+            Span::styled("  Import wallet", Style::default().fg(theme().fg)),
         ]),
         Line::from(vec![
-            Span::styled("  s", Style::default().fg(COLOR_FAWN).add_modifier(Modifier::BOLD)),
-            Span::styled("  Sign message", Style::default().fg(COLOR_ASH)),
+            Span::styled("  s", Style::default().fg(theme().accent).add_modifier(Modifier::BOLD)),
+            Span::styled("  Sign message", Style::default().fg(theme().fg)),
         ]),
         Line::from(vec![
-            Span::styled("  o", Style::default().fg(COLOR_FAWN).add_modifier(Modifier::BOLD)),
-            Span::styled("  Run setup wizard (Settings tab)", Style::default().fg(COLOR_ASH)),
+            Span::styled("  o", Style::default().fg(theme().accent).add_modifier(Modifier::BOLD)),
+            Span::styled("  Run setup wizard (Settings tab)", Style::default().fg(theme().fg)),
         ]),
         Line::from(vec![
-            Span::styled("  2", Style::default().fg(COLOR_FAWN).add_modifier(Modifier::BOLD)),
-            Span::styled("  Manage wallets (Accounts tab)", Style::default().fg(COLOR_ASH)),
+            Span::styled("  2", Style::default().fg(theme().accent).add_modifier(Modifier::BOLD)),
+            Span::styled("  Manage wallets (Accounts tab)", Style::default().fg(theme().fg)),
         ]),
     ]);
 
@@ -2550,10 +2690,10 @@ fn render_settings(frame: &mut ratatui::prelude::Frame, area: Rect, app: &App) {
             .block(
                 Block::default()
                     .borders(Borders::ALL)
-                    .border_style(Style::default().fg(COLOR_BARK))
+                    .border_style(Style::default().fg(theme().border))
                     .title("Configuration"),
             )
-            .style(Style::default().fg(COLOR_ASH)),
+            .style(Style::default().fg(theme().fg)),
         layout[0],
     );
     frame.render_widget(
@@ -2561,10 +2701,10 @@ fn render_settings(frame: &mut ratatui::prelude::Frame, area: Rect, app: &App) {
             .block(
                 Block::default()
                     .borders(Borders::ALL)
-                    .border_style(Style::default().fg(COLOR_BARK))
+                    .border_style(Style::default().fg(theme().border))
                     .title("Wallets"),
             )
-            .style(Style::default().fg(COLOR_ASH)),
+            .style(Style::default().fg(theme().fg)),
         layout[1],
     );
     frame.render_widget(
@@ -2572,10 +2712,10 @@ fn render_settings(frame: &mut ratatui::prelude::Frame, area: Rect, app: &App) {
             .block(
                 Block::default()
                     .borders(Borders::ALL)
-                    .border_style(Style::default().fg(COLOR_BARK))
+                    .border_style(Style::default().fg(theme().border))
                     .title("Shortcuts"),
             )
-            .style(Style::default().fg(COLOR_ASH)),
+            .style(Style::default().fg(theme().fg)),
         layout[2],
     );
 }
@@ -2606,9 +2746,9 @@ fn render_footer(
             .block(
                 Block::default()
                     .borders(Borders::ALL)
-                    .border_style(Style::default().fg(COLOR_BARK)),
+                    .border_style(Style::default().fg(theme().border)),
             )
-            .style(Style::default().fg(COLOR_ASH));
+            .style(Style::default().fg(theme().fg));
         frame.render_widget(footer, area);
         return;
     }
@@ -2620,7 +2760,7 @@ fn render_footer(
 
     let nav = Paragraph::new(nav_text)
         .alignment(Alignment::Center)
-        .style(Style::default().fg(COLOR_ASH));
+        .style(Style::default().fg(theme().fg));
     let status_line = Paragraph::new(status)
         .alignment(Alignment::Center)
         .style(status_style(status));
@@ -2628,7 +2768,7 @@ fn render_footer(
     frame.render_widget(
         Block::default()
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(COLOR_BARK)),
+            .border_style(Style::default().fg(theme().border)),
         area,
     );
     frame.render_widget(nav, layout[0]);
@@ -2726,10 +2866,10 @@ fn render_onboarding_modal(frame: &mut ratatui::prelude::Frame, app: &App) {
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(COLOR_BARK))
+                .border_style(Style::default().fg(theme().border))
                 .title("Setup"),
         )
-        .style(Style::default().fg(COLOR_ASH));
+        .style(Style::default().fg(theme().fg));
 
     frame.render_widget(paragraph, modal);
 }
@@ -2842,10 +2982,10 @@ fn render_input_modal(frame: &mut ratatui::prelude::Frame, app: &App) {
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(COLOR_BARK))
+                .border_style(Style::default().fg(theme().border))
                 .title(title),
         )
-        .style(Style::default().fg(COLOR_ASH));
+        .style(Style::default().fg(theme().fg));
 
     frame.render_widget(paragraph, modal);
 }
@@ -2853,7 +2993,7 @@ fn render_input_modal(frame: &mut ratatui::prelude::Frame, app: &App) {
 fn status_style(message: &str) -> Style {
     let lower = message.to_ascii_lowercase();
     if lower.contains("error") || lower.contains("failed") || lower.contains("bad") {
-        Style::default().fg(COLOR_EMBER)
+        Style::default().fg(theme().accent)
     } else if lower.contains("stored")
         || lower.contains("signed")
         || lower.contains("set to")
@@ -2866,14 +3006,14 @@ fn status_style(message: &str) -> Style {
         || lower.contains("updated")
         || lower.contains("deleted")
     {
-        Style::default().fg(COLOR_MOSS)
+        Style::default().fg(theme().green)
     } else {
-        Style::default().fg(COLOR_STONE)
+        Style::default().fg(theme().fg_dim)
     }
 }
 
 fn render_background(frame: &mut ratatui::prelude::Frame, area: Rect) {
-    let background = Block::default().style(Style::default().bg(COLOR_SOOT));
+    let background = Block::default().style(Style::default().bg(theme().bg));
     frame.render_widget(background, area);
 }
 

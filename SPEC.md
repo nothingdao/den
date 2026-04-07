@@ -73,7 +73,7 @@ Feature/source-of-truth status for the current app.
 - Done: Tab navigation and responsive layout
 - Done: Sidebar navigation
 - Done: Status bar and modal flows
-- Done: Earthy color theme
+- Done: Configurable color theme (loaded from `~/.config/den/theme.toml`, hot-reloads on file change ~250ms)
 - Pending: Clipboard copy
 - Pending: QR display
 - Pending: Async loading/spinners

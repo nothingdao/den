@@ -184,7 +184,7 @@ Configuration:
 | Keyboard shortcuts | Done | |
 | Input modals | Done | Import key, sign message |
 | Status bar with context colors | Done | Error/success/info coloring |
-| Color theme | Done | Earthy palette (bark, fawn, ash, moss, ember) |
+| Color theme | Done | Loaded from `~/.config/den/theme.toml`, hot-reloads on file change |
 | Copy address to clipboard | Not started | |
 | QR code display | Not started | Receive tab shows placeholder |
 | Async data loading | Not started | Blocking reqwest freezes UI |
