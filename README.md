@@ -26,6 +26,7 @@ den
 - Live balance + token fetch from Helius RPC with non-blocking TUI refreshes
 - Keychain-backed key import (macOS)
 - Message signing from stored key
+- Receive-address QR display and clipboard copy shortcuts
 
 ## Requirements
 - Rust stable
@@ -185,8 +186,8 @@ Configuration:
 | Input modals | Done | Import key, sign message |
 | Status bar with context colors | Done | Error/success/info coloring |
 | Color theme | Done | Loaded from `~/.config/den/theme.toml`, hot-reloads on file change |
-| Copy address to clipboard | Not started | |
-| QR code display | Not started | Receive tab shows placeholder |
+| Copy address to clipboard | Done | Press `c` in wallet/contact/receive contexts |
+| QR code display | Done | Receive tab renders the active address as a QR code |
 | Async data loading | Done | TUI refreshes run on a background worker |
 | Loading / spinner indicators | Done | Refresh state is shown in Overview/Settings/status |
 | Auto-refresh on interval | Not started | Manual `r` only |

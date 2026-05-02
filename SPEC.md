@@ -74,8 +74,8 @@ Feature/source-of-truth status for the current app.
 - Done: Sidebar navigation
 - Done: Status bar and modal flows
 - Done: Configurable color theme (loaded from `~/.config/den/theme.toml`, hot-reloads on file change ~250ms)
-- Pending: Clipboard copy
-- Pending: QR display
+- Done: Clipboard copy for wallet/contact receive addresses
+- Done: QR display for receive address
 - Done: Async loading/spinners for wallet refreshes
 - Pending: Auto-refresh
 

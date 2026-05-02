@@ -39,3 +39,18 @@ Checks:
 Commit: pending
 Blockers: none
 
+## #12 Add clipboard copy and QR display UX utilities
+Status: completed.
+Changes:
+- Added `c` clipboard-copy shortcut for selected wallet, active receive address, settings/overview active address, and selected contact address.
+- Added receive-address QR rendering using the `qrcode` crate.
+- Updated receive screen and footer hints.
+- Updated SPEC.md and README.md.
+Checks:
+- cargo fmt: passed
+- cargo test: passed (0 tests; existing warnings)
+- cargo build: passed (existing warnings)
+- cargo clippy: passed with warnings
+Commit: pending
+Blockers: none
+

@@ -14,6 +14,7 @@ use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
+use qrcode::QrCode;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::prelude::{Backend, CrosstermBackend, Terminal};
 use ratatui::style::{Color, Modifier, Style};
@@ -1275,6 +1276,37 @@ impl App {
         self.drain_refresh_results();
     }
 
+    fn copy_context_to_clipboard(&mut self) {
+        let target = match self.tab {
+            Tab::Accounts => self
+                .accounts
+                .get(self.selected_account)
+                .map(|account| ("wallet address", account.address.clone())),
+            Tab::Receive | Tab::Overview | Tab::Settings => self
+                .accounts
+                .iter()
+                .find(|account| account.is_active)
+                .map(|account| ("active wallet address", account.address.clone())),
+            Tab::AddressBook => {
+                let idx = self.contact_detail_index.unwrap_or(self.selected_contact);
+                self.contacts
+                    .get(idx)
+                    .map(|contact| ("contact address", contact.address.clone()))
+            }
+            _ => None,
+        };
+
+        let Some((label, value)) = target else {
+            self.status = "Nothing to copy in this view".to_string();
+            return;
+        };
+
+        match copy_to_clipboard(&value) {
+            Ok(_) => self.status = format!("Copied {} to clipboard", label),
+            Err(err) => self.status = format!("Clipboard copy failed: {}", err),
+        }
+    }
+
     fn on_key(&mut self, code: KeyCode) {
         if self.onboarding.active {
             self.handle_onboarding_mode(code);
@@ -1388,6 +1420,9 @@ impl App {
                 } else if self.tab == Tab::AddressBook && self.contact_detail_index.is_some() {
                     self.contact_detail_index = None;
                 }
+            }
+            KeyCode::Char('c') => {
+                self.copy_context_to_clipboard();
             }
             KeyCode::Char('o') => {
                 if self.tab == Tab::AddressBook {
@@ -2813,16 +2848,21 @@ fn render_send(frame: &mut ratatui::prelude::Frame, area: Rect, app: &App) {
 }
 
 fn render_receive(frame: &mut ratatui::prelude::Frame, area: Rect, app: &App) {
-    let (account_name, account_address) = active_account(app);
+    let (account_name, account_address) = active_account_full(app);
+
+    let layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(6), Constraint::Min(0)])
+        .split(area);
 
     let receive = Text::from(vec![
         Line::from(format!("Account: {}", account_name)),
         Line::from(format!("Address: {}", account_address)),
         Line::from("Memo: (optional)"),
-        Line::from("QR: [placeholder]"),
+        Line::from("Press c to copy the receive address."),
     ]);
 
-    let paragraph = Paragraph::new(receive)
+    let details = Paragraph::new(receive)
         .alignment(Alignment::Left)
         .block(
             Block::default()
@@ -2832,7 +2872,18 @@ fn render_receive(frame: &mut ratatui::prelude::Frame, area: Rect, app: &App) {
         )
         .style(Style::default().fg(theme().fg));
 
-    frame.render_widget(paragraph, area);
+    let qr = Paragraph::new(qr_text(&account_address))
+        .alignment(Alignment::Center)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(theme().border))
+                .title("Address QR"),
+        )
+        .style(Style::default().fg(theme().fg));
+
+    frame.render_widget(details, layout[0]);
+    frame.render_widget(qr, layout[1]);
 }
 
 fn render_settings(frame: &mut ratatui::prelude::Frame, area: Rect, app: &App) {
@@ -3004,13 +3055,18 @@ fn render_settings(frame: &mut ratatui::prelude::Frame, area: Rect, app: &App) {
 
 fn footer_nav_text(tab: Tab, in_detail: bool) -> &'static str {
     match tab {
-        Tab::Accounts if in_detail => "Enter:activate | e:rename | d:delete | Esc:back | q:quit",
-        Tab::Accounts => {
-            "Enter:details | a:add | w:watch | e:rename | d:delete | r:refresh | q:quit"
+        Tab::Accounts if in_detail => {
+            "Enter:activate | c:copy | e:rename | d:delete | Esc:back | q:quit"
         }
-        Tab::AddressBook if in_detail => "e:name | a:address | o:notes | d:delete | Esc:back",
-        Tab::AddressBook => "Enter:details | a:add | e:edit | d:delete | q:quit",
-        _ => "1-8 | up/down | n:network | i:import | s:sign | r:refresh | q:quit",
+        Tab::Accounts => {
+            "Enter:details | c:copy | a:add | w:watch | e:rename | d:delete | r:refresh | q:quit"
+        }
+        Tab::Receive => "c:copy address | QR shown | q:quit",
+        Tab::AddressBook if in_detail => {
+            "c:copy | e:name | a:address | o:notes | d:delete | Esc:back"
+        }
+        Tab::AddressBook => "Enter:details | c:copy | a:add | e:edit | d:delete | q:quit",
+        _ => "1-8 | up/down | c:copy | n:network | i:import | s:sign | r:refresh | q:quit",
     }
 }
 
@@ -3077,6 +3133,56 @@ fn active_account(app: &App) -> (String, String) {
         .find(|a| a.is_active)
         .map(|a| (a.name.clone(), short_address(&a.address)))
         .unwrap_or_else(|| ("None".to_string(), "Unset".to_string()))
+}
+
+fn active_account_full(app: &App) -> (String, String) {
+    app.accounts
+        .iter()
+        .find(|a| a.is_active)
+        .map(|a| (a.name.clone(), a.address.clone()))
+        .unwrap_or_else(|| ("None".to_string(), "Unset".to_string()))
+}
+
+fn copy_to_clipboard(value: &str) -> Result<(), Box<dyn Error>> {
+    let commands: &[(&str, &[&str])] = if cfg!(target_os = "macos") {
+        &[("pbcopy", &[])]
+    } else {
+        &[("wl-copy", &[]), ("xclip", &["-selection", "clipboard"])]
+    };
+
+    for (program, args) in commands {
+        let mut child = match Command::new(program)
+            .args(*args)
+            .stdin(Stdio::piped())
+            .spawn()
+        {
+            Ok(child) => child,
+            Err(_) => continue,
+        };
+        if let Some(stdin) = child.stdin.as_mut() {
+            stdin.write_all(value.as_bytes())?;
+        }
+        if child.wait()?.success() {
+            return Ok(());
+        }
+    }
+
+    Err("no supported clipboard command found".into())
+}
+
+fn qr_text(value: &str) -> String {
+    if value == "Unset" || value.trim().is_empty() {
+        return "QR unavailable: no active receive address".to_string();
+    }
+
+    match QrCode::new(value.as_bytes()) {
+        Ok(code) => code
+            .render::<char>()
+            .quiet_zone(false)
+            .module_dimensions(2, 1)
+            .build(),
+        Err(_) => "QR unavailable: address could not be encoded".to_string(),
+    }
 }
 
 fn render_onboarding_modal(frame: &mut ratatui::prelude::Frame, app: &App) {
