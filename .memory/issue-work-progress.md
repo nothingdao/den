@@ -89,7 +89,15 @@ Checks:
 Commit: pending in this run.
 Blockers: none for approved #9 scope.
 
-## #10/#13/#14/#15
-Status: not started in this run yet.
-Reason: #8/#9 vertical slice completed first due safety-critical send/review dependency.
+## #10 Expand key management: generation, seed phrases, HD wallets, and backup
+Status: blocked/not started after #8/#9.
+Blocker:
+- Completing #10 safely needs product/security decisions that are not yet approved: mnemonic word count/language, whether mnemonic creation is required vs keypair-only generation, HD derivation defaults and account-index UX, passphrase support, local backup/export format, and exact confirmation language for showing/exporting secrets.
+- Secret export/backup can be made confirmation-gated, but the recovery model and derivation defaults should not be guessed.
+Checks: not run for #10 because no code changes were made after the #8/#9 validation set.
+Commit: none for implementation; progress note pending.
+
+## #13/#14/#15
+Status: not started in this run.
+Reason: stopped at #10 per safety instruction rather than skipping ahead after identifying key-management security/product blockers.
 
