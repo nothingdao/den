@@ -998,6 +998,7 @@ dependencies = [
  "solana-derivation-path",
  "solana-keypair",
  "solana-sdk",
+ "solana-system-interface",
  "spl-associated-token-account",
  "spl-token",
  "toml 0.8.23",

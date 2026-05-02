@@ -28,8 +28,8 @@ use solana_sdk::hash::Hash;
 use solana_sdk::instruction::Instruction;
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::{Keypair, Signer};
-use solana_sdk::system_instruction;
 use solana_sdk::transaction::Transaction as SolanaTransaction;
+use solana_system_interface::instruction as system_instruction;
 use spl_associated_token_account::get_associated_token_address;
 use spl_associated_token_account::instruction::create_associated_token_account_idempotent;
 

@@ -23,6 +23,16 @@ cargo run -- --status
 DEN_SECRET_KEY=<key> cargo run -- --add-wallet main
 ```
 
+## Development Flow
+
+After changing app behavior, always reinstall the local binary so `den` runs the latest code without extra user steps:
+
+```bash
+cargo install --path . --force
+```
+
+Run this after validation (`cargo fmt`, `cargo test`, `cargo build`, and clippy when practical), especially before asking the user to manually test TUI behavior.
+
 ## Current Install Path
 
 ```bash
