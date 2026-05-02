@@ -108,3 +108,4 @@ The binary users run is `den`.
 - `product-ecosystem.md` — Den TUI/daemon/browser-extension product roles
 - `daemon-api.md` — proposed documented local API for Den clients
 - `key-storage-api.md` — provider abstraction for Keychain, encrypted files, hardware signers, and other backends
+- `linux-support.md` — Linux/XDG paths, Secret Service, encrypted-file fallback, Unix sockets, and packaging roadmap

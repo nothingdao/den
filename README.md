@@ -125,6 +125,7 @@ Design docs:
 - `docs/architecture/product-ecosystem.md`
 - `docs/architecture/daemon-api.md`
 - `docs/architecture/key-storage-api.md`
+- `docs/architecture/linux-support.md`
 
 Daemon API goals:
 
@@ -133,6 +134,7 @@ Daemon API goals:
 - wallet CRUD for non-secret operations
 - signing APIs that never expose private keys
 - key-storage provider abstraction, not macOS-only design
+- Linux support through XDG paths, Secret Service/encrypted-file providers, and Unix sockets
 
 ## Feature Status
 
