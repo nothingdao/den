@@ -23,7 +23,7 @@ den
 
 ## Features
 - Multi-tab wallet overview (accounts, tokens, history, address book, settings)
-- Live balance + token fetch from Helius RPC
+- Live balance + token fetch from Helius RPC with non-blocking TUI refreshes
 - Keychain-backed key import (macOS)
 - Message signing from stored key
 
@@ -187,8 +187,8 @@ Configuration:
 | Color theme | Done | Loaded from `~/.config/den/theme.toml`, hot-reloads on file change |
 | Copy address to clipboard | Not started | |
 | QR code display | Not started | Receive tab shows placeholder |
-| Async data loading | Not started | Blocking reqwest freezes UI |
-| Loading / spinner indicators | Not started | |
+| Async data loading | Done | TUI refreshes run on a background worker |
+| Loading / spinner indicators | Done | Refresh state is shown in Overview/Settings/status |
 | Auto-refresh on interval | Not started | Manual `r` only |
 
 ### CLI

@@ -11,7 +11,7 @@ Den is currently implemented primarily in `src/main.rs`. Application state, TUI 
 - Wallets: full wallets and watch-only wallets, with active-wallet selection
 - Config: local file backend plus optional Bitwarden-backed sync
 - Contacts: persisted contact list with JSON import/export
-- Network data: blocking Helius requests for balances, tokens, and history
+- Network data: Helius requests for balances, tokens, and history run on a background refresh worker
 - Release: GitHub Actions builds macOS binaries and publishes release assets used by Homebrew
 
 ## State Model
@@ -34,12 +34,14 @@ Typical refresh flow:
 user action
 -> resolve active wallet + config
 -> build RPC/DAS requests
--> fetch balances/tokens/history via blocking reqwest
+-> enqueue background refresh worker
+-> fetch balances/tokens/history via blocking reqwest off the UI thread
+-> send refreshed snapshot back over a channel
 -> map responses into app state
 -> redraw TUI
 ```
 
-Because requests are blocking, the UI can stall during refresh.
+Requests still use blocking reqwest internally, but refresh work runs off the UI thread so keyboard input and redraws continue while loading.
 
 ## Storage
 

@@ -76,7 +76,7 @@ Feature/source-of-truth status for the current app.
 - Done: Configurable color theme (loaded from `~/.config/den/theme.toml`, hot-reloads on file change ~250ms)
 - Pending: Clipboard copy
 - Pending: QR display
-- Pending: Async loading/spinners
+- Done: Async loading/spinners for wallet refreshes
 - Pending: Auto-refresh
 
 ## Packaging
@@ -87,6 +87,5 @@ Feature/source-of-truth status for the current app.
 
 ## Known Gaps
 
-- Blocking HTTP still freezes the UI during refresh
 - Send flow remains mostly static
 - Chart data is still seeded/fake
