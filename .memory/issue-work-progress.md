@@ -20,7 +20,7 @@ Checks:
 - cargo test: passed (0 tests; existing warnings)
 - cargo build: passed (existing warnings plus now-unused helper warning)
 - cargo clippy: passed with warnings
-Commit: pending
+Commit: eeabbbb feat: make wallet refresh non-blocking (#7)
 Blockers: none
 
 ## #11 Complete contact add, edit, and delete flows
@@ -36,7 +36,7 @@ Checks:
 - cargo test: passed (0 tests; existing warnings)
 - cargo build: passed (existing warnings)
 - cargo clippy: passed with warnings
-Commit: pending
+Commit: 112c388 feat: complete contact management flows (#11)
 Blockers: none
 
 ## #12 Add clipboard copy and QR display UX utilities
@@ -51,6 +51,18 @@ Checks:
 - cargo test: passed (0 tests; existing warnings)
 - cargo build: passed (existing warnings)
 - cargo clippy: passed with warnings
-Commit: pending
+Commit: 5129622 feat: add clipboard copy and receive QR (#12)
 Blockers: none
+
+## #8 Implement SOL and SPL send flows
+Status: blocked/not started.
+Blocker:
+- A complete SOL/SPL send flow requires security/product decisions before implementation: exact confirmation UX, simulation/blocking policy, priority-fee policy, token-account/ATA behavior, versioned transaction scope, and SPL token program/Token2022 support boundaries.
+- Watch-only signing restrictions are clear, but implementing transaction construction/sign/broadcast without approved review/simulation decisions would be unsafe.
+Checks: not run for #8 because no code changes were made.
+Commit: none.
+
+## #9/#10/#13/#14/#15
+Status: not started in this run.
+Reason: stopped at #8 per safety instruction rather than skipping ahead after identifying send-flow security/product blockers.
 
