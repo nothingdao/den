@@ -104,7 +104,7 @@ Checks:
 - cargo test: passed (0 tests; warnings)
 - cargo build: passed (warnings)
 - cargo clippy: passed with warnings
-Commit: pending in this run.
+Commit: b05063a feat: complete key asset rpc and theme work (#10 #13 #14 #15)
 Blockers: none for approved #10 scope.
 
 ## #13 Improve asset support: Token2022 validation, NFTs, and real chart data
@@ -120,7 +120,7 @@ Checks:
 - cargo test: passed (0 tests; warnings)
 - cargo build: passed (warnings)
 - cargo clippy: passed with warnings
-Commit: pending in this run.
+Commit: b05063a feat: complete key asset rpc and theme work (#10 #13 #14 #15)
 Blockers: none.
 
 ## #14 Support custom RPC endpoints and richer network configuration
@@ -136,7 +136,7 @@ Checks:
 - cargo test: passed (0 tests; warnings)
 - cargo build: passed (warnings)
 - cargo clippy: passed with warnings
-Commit: pending in this run.
+Commit: b05063a feat: complete key asset rpc and theme work (#10 #13 #14 #15)
 Blockers: none.
 
 ## #15 Refactor src/main.rs into focused modules
@@ -150,6 +150,6 @@ Checks:
 - cargo test: passed (0 tests; warnings)
 - cargo build: passed (warnings)
 - cargo clippy: passed with warnings
-Commit: pending in this run.
+Commit: b05063a feat: complete key asset rpc and theme work (#10 #13 #14 #15)
 Blockers: further modularization should be done as smaller follow-up PRs/modules.
 
