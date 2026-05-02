@@ -23,3 +23,19 @@ Checks:
 Commit: pending
 Blockers: none
 
+## #11 Complete contact add, edit, and delete flows
+Status: completed.
+Changes:
+- Hardened existing TUI add/edit/delete flows with Solana public-key validation.
+- Added duplicate-address checks for add/edit.
+- Persist errors are surfaced in status instead of silently ignored for contact changes.
+- Contact imports now skip invalid addresses in addition to duplicates.
+- Updated SPEC.md and README.md.
+Checks:
+- cargo fmt: passed
+- cargo test: passed (0 tests; existing warnings)
+- cargo build: passed (existing warnings)
+- cargo clippy: passed with warnings
+Commit: pending
+Blockers: none
+

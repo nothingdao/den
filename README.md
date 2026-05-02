@@ -91,7 +91,7 @@ Wallet Management:
 Contacts:
 --list-contacts         List all contacts
 --export-contacts [FILE] Export contacts as JSON (stdout or file)
---import-contacts FILE  Import contacts from JSON, skip duplicates
+--import-contacts FILE  Import contacts from JSON, skip duplicates/invalid addresses
 
 Configuration:
 --set-api-key KEY       Store Helius API key in config
@@ -171,7 +171,7 @@ Configuration:
 | Feature | Status | Notes |
 |---------|--------|-------|
 | View contacts | Done | CLI list and TUI address book |
-| Add / edit / delete contacts | Partial | Import/export supported, interactive editing still limited |
+| Add / edit / delete contacts | Done | TUI flows validate Solana addresses and duplicate addresses |
 | Persistent storage | Done | Contacts saved to local JSON config |
 
 ### TUI / UX

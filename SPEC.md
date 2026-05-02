@@ -57,7 +57,7 @@ Feature/source-of-truth status for the current app.
 - Done: Persistent contact storage
 - Done: Import contacts from JSON
 - Done: Export contacts as JSON
-- Partial: Add/edit/delete contact flows
+- Done: Add/edit/delete contact flows with address validation and duplicate checks
 
 ## Configuration
 

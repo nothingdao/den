@@ -24,6 +24,7 @@ use ratatui::widgets::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::{Keypair, Signer};
 
 const KEYCHAIN_SERVICE: &str = "den-wallet";
@@ -1023,6 +1024,34 @@ fn save_contacts(file: &ContactsFile) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+fn validate_solana_address(address: &str) -> Result<(), String> {
+    let trimmed = address.trim();
+    if trimmed.is_empty() {
+        return Err("Address cannot be empty".to_string());
+    }
+    trimmed
+        .parse::<Pubkey>()
+        .map(|_| ())
+        .map_err(|_| "Address must be a valid Solana public key".to_string())
+}
+
+fn contact_address_exists(
+    contacts: &[Contact],
+    address: &str,
+    except_index: Option<usize>,
+) -> bool {
+    contacts
+        .iter()
+        .enumerate()
+        .any(|(idx, contact)| Some(idx) != except_index && contact.address.trim() == address.trim())
+}
+
+fn persist_contacts(contacts: &[Contact]) -> Result<(), Box<dyn Error>> {
+    let mut file = load_contacts();
+    file.contacts = contacts.to_vec();
+    save_contacts(&file)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum InputMode {
     None,
@@ -1770,19 +1799,25 @@ impl App {
                     InputMode::AddContactAddress => {
                         if input.is_empty() {
                             self.status = "Add contact cancelled".to_string();
+                        } else if let Err(err) = validate_solana_address(&input) {
+                            self.status = err;
+                            return;
+                        } else if contact_address_exists(&self.contacts, &input, None) {
+                            self.status = "Contact address already exists".to_string();
+                            return;
                         } else {
                             let contact = Contact {
                                 name: self.import_state.wallet_name.clone(),
                                 address: input,
-                                network: "mainnet".to_string(),
+                                network: self.network.label().to_ascii_lowercase(),
                                 notes: String::new(),
                             };
                             let name = contact.name.clone();
                             self.contacts.push(contact);
-                            let mut file = load_contacts();
-                            file.contacts = self.contacts.clone();
-                            let _ = save_contacts(&file);
-                            self.status = format!("Contact '{}' added", name);
+                            match persist_contacts(&self.contacts) {
+                                Ok(_) => self.status = format!("Contact '{}' added", name),
+                                Err(err) => self.status = format!("Contact save failed: {}", err),
+                            }
                         }
                     }
                     InputMode::EditContactName => {
@@ -1792,24 +1827,35 @@ impl App {
                             let idx = self.contact_detail_index.unwrap_or(self.selected_contact);
                             if idx < self.contacts.len() {
                                 self.contacts[idx].name = input.clone();
-                                let mut file = load_contacts();
-                                file.contacts = self.contacts.clone();
-                                let _ = save_contacts(&file);
-                                self.status = format!("Contact updated to '{}'", input);
+                                match persist_contacts(&self.contacts) {
+                                    Ok(_) => {
+                                        self.status = format!("Contact updated to '{}'", input)
+                                    }
+                                    Err(err) => {
+                                        self.status = format!("Contact save failed: {}", err)
+                                    }
+                                }
                             }
                         }
                     }
                     InputMode::EditContactAddress => {
                         if input.is_empty() {
                             self.status = "Edit cancelled".to_string();
-                        } else {
-                            if let Some(idx) = self.contact_detail_index {
-                                if idx < self.contacts.len() {
-                                    self.contacts[idx].address = input;
-                                    let mut file = load_contacts();
-                                    file.contacts = self.contacts.clone();
-                                    let _ = save_contacts(&file);
-                                    self.status = "Address updated".to_string();
+                        } else if let Err(err) = validate_solana_address(&input) {
+                            self.status = err;
+                            return;
+                        } else if let Some(idx) = self.contact_detail_index {
+                            if idx < self.contacts.len() {
+                                if contact_address_exists(&self.contacts, &input, Some(idx)) {
+                                    self.status = "Contact address already exists".to_string();
+                                    return;
+                                }
+                                self.contacts[idx].address = input;
+                                match persist_contacts(&self.contacts) {
+                                    Ok(_) => self.status = "Address updated".to_string(),
+                                    Err(err) => {
+                                        self.status = format!("Contact save failed: {}", err)
+                                    }
                                 }
                             }
                         }
@@ -1818,10 +1864,12 @@ impl App {
                         if let Some(idx) = self.contact_detail_index {
                             if idx < self.contacts.len() {
                                 self.contacts[idx].notes = input;
-                                let mut file = load_contacts();
-                                file.contacts = self.contacts.clone();
-                                let _ = save_contacts(&file);
-                                self.status = "Notes updated".to_string();
+                                match persist_contacts(&self.contacts) {
+                                    Ok(_) => self.status = "Notes updated".to_string(),
+                                    Err(err) => {
+                                        self.status = format!("Contact save failed: {}", err)
+                                    }
+                                }
                             }
                         }
                     }
@@ -1831,16 +1879,20 @@ impl App {
                             if idx < self.contacts.len() {
                                 let name = self.contacts[idx].name.clone();
                                 self.contacts.remove(idx);
-                                let mut file = load_contacts();
-                                file.contacts = self.contacts.clone();
-                                let _ = save_contacts(&file);
-                                self.contact_detail_index = None;
-                                if self.selected_contact >= self.contacts.len()
-                                    && !self.contacts.is_empty()
-                                {
-                                    self.selected_contact = self.contacts.len() - 1;
+                                match persist_contacts(&self.contacts) {
+                                    Ok(_) => {
+                                        self.contact_detail_index = None;
+                                        if self.selected_contact >= self.contacts.len()
+                                            && !self.contacts.is_empty()
+                                        {
+                                            self.selected_contact = self.contacts.len() - 1;
+                                        }
+                                        self.status = format!("Contact '{}' deleted", name);
+                                    }
+                                    Err(err) => {
+                                        self.status = format!("Contact save failed: {}", err)
+                                    }
                                 }
-                                self.status = format!("Contact '{}' deleted", name);
                             }
                         } else {
                             self.status = "Delete cancelled".to_string();
@@ -3610,8 +3662,15 @@ fn handle_cli() -> Result<bool, Box<dyn Error>> {
                 let mut file = load_contacts();
                 let mut added = 0u32;
                 let mut skipped = 0u32;
+                let mut invalid = 0u32;
                 for contact in incoming.contacts {
-                    if file.contacts.iter().any(|c| c.address == contact.address) {
+                    if validate_solana_address(&contact.address).is_err() {
+                        invalid += 1;
+                    } else if file
+                        .contacts
+                        .iter()
+                        .any(|c| c.address.trim() == contact.address.trim())
+                    {
                         skipped += 1;
                     } else {
                         file.contacts.push(contact);
@@ -3620,8 +3679,8 @@ fn handle_cli() -> Result<bool, Box<dyn Error>> {
                 }
                 save_contacts(&file)?;
                 println!(
-                    "Imported {} contacts, skipped {} duplicates.",
-                    added, skipped
+                    "Imported {} contacts, skipped {} duplicates, ignored {} invalid.",
+                    added, skipped, invalid
                 );
                 return Ok(true);
             }
