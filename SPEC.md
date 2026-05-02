@@ -11,10 +11,10 @@ Feature/source-of-truth status for the current app.
 - Done: Multiple wallets
 - Done: Watch-only wallets
 - Done: Switch, rename, and remove wallets
-- Pending: Generate new keypair
-- Pending: Mnemonic / seed phrase
-- Pending: HD derivation
-- Pending: Export / backup key
+- Done: Generate new random keypair
+- Done: Create/restore 12-word English seed phrase wallets
+- Done: HD derivation at `m/44'/501'/0'/0'` (account index 0)
+- Done: Confirmation-gated secret reveal/copy for private keys or seed phrases
 - Pending: Password / PIN protection
 - Pending: Session auto-lock
 - Pending: Hardware wallet support
@@ -24,9 +24,9 @@ Feature/source-of-truth status for the current app.
 - Done: SOL balance via Helius
 - Done: SPL token balances and metadata
 - Done: Token prices and portfolio total
-- Pending: Token2022 support validation
-- Pending: NFT display
-- Pending: Real-time charts
+- Partial: Token2022 assets are marked as unsupported/unknown when DAS reports non-SPL Token programs; sends remain blocked
+- Done: NFT display summary/list from DAS assets
+- Pending: Real-time charts (unavailable; fake seeded charts removed)
 
 ## Transactions
 
@@ -49,7 +49,7 @@ Feature/source-of-truth status for the current app.
 
 - Done: Mainnet and devnet
 - Done: Network toggle
-- Pending: Custom RPC endpoint
+- Done: Custom RPC endpoint for standard RPC balance/history and send operations
 
 ## Contacts
 
@@ -87,5 +87,6 @@ Feature/source-of-truth status for the current app.
 
 ## Known Gaps
 
-- Token2022 sends remain disabled until asset support is validated
+- Token2022 sends remain disabled; non-SPL Token programs are visible but unsupported for sending
+- Custom RPC endpoints do not provide Helius DAS token/NFT metadata unless they implement those methods
 - Chart data is unavailable rather than real historical charting

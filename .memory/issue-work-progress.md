@@ -69,7 +69,7 @@ Checks:
 - cargo test: passed (0 tests; warnings)
 - cargo build: passed (warnings)
 - cargo clippy: passed with warnings
-Commit: pending in this run.
+Commit: b1c4c29 feat: add reviewed send transaction flow (#8 #9)
 Blockers: none for approved #8 scope.
 
 ## #9 Add transaction detail, simulation, and confirmation review
@@ -86,18 +86,70 @@ Checks:
 - cargo test: passed (0 tests; warnings)
 - cargo build: passed (warnings)
 - cargo clippy: passed with warnings
-Commit: pending in this run.
+Commit: b1c4c29 feat: add reviewed send transaction flow (#8 #9)
 Blockers: none for approved #9 scope.
 
 ## #10 Expand key management: generation, seed phrases, HD wallets, and backup
-Status: blocked/not started after #8/#9.
-Blocker:
-- Completing #10 safely needs product/security decisions that are not yet approved: mnemonic word count/language, whether mnemonic creation is required vs keypair-only generation, HD derivation defaults and account-index UX, passphrase support, local backup/export format, and exact confirmation language for showing/exporting secrets.
-- Secret export/backup can be made confirmation-gated, but the recovery model and derivation defaults should not be guessed.
-Checks: not run for #10 because no code changes were made after the #8/#9 validation set.
-Commit: none for implementation; progress note pending.
+Status: completed with approved conservative scope.
+Changes:
+- Added random keypair generation from the Accounts tab (`g`) and CLI (`--generate-wallet`).
+- Added 12-word English BIP39 seed wallet creation from the Accounts tab (`m`) with required `I SAVED IT` confirmation before storing.
+- Added seed phrase restore from the Accounts tab (`p`) and CLI (`--restore-mnemonic`, reading `DEN_MNEMONIC`).
+- Derived mnemonic wallets at `m/44'/501'/0'/0'` with account index 0 and no passphrase.
+- Stored private keys in Keychain as before; stored mnemonic phrases in Keychain only for mnemonic-created/restored wallets.
+- Added confirmation-gated backup reveal (`x` then type `REVEAL`) that displays/copies either base58 private key or seed phrase depending on wallet origin.
+- Updated SPEC.md, README.md, and architecture docs.
+Checks:
+- cargo fmt: passed
+- cargo test: passed (0 tests; warnings)
+- cargo build: passed (warnings)
+- cargo clippy: passed with warnings
+Commit: pending in this run.
+Blockers: none for approved #10 scope.
 
-## #13/#14/#15
-Status: not started in this run.
-Reason: stopped at #10 per safety instruction rather than skipping ahead after identifying key-management security/product blockers.
+## #13 Improve asset support: Token2022 validation, NFTs, and real chart data
+Status: completed with conservative scope.
+Changes:
+- Removed seeded/fake chart rendering; asset details now explicitly say charts are unavailable until real history exists.
+- Added DAS NFT collection into app state and displays NFT count/list in the asset details panel.
+- Marked non-SPL Token programs as unsupported/Token2022-like in the token table/details.
+- Kept Token2022/non-SPL sends blocked.
+- Updated SPEC.md, README.md, and architecture docs.
+Checks:
+- cargo fmt: passed
+- cargo test: passed (0 tests; warnings)
+- cargo build: passed (warnings)
+- cargo clippy: passed with warnings
+Commit: pending in this run.
+Blockers: none.
+
+## #14 Support custom RPC endpoints and richer network configuration
+Status: completed with conservative scope.
+Changes:
+- Added `custom` network mode with persisted `network.custom_rpc_url`.
+- Added CLI `--set-rpc-url`, `--clear-rpc-url`, and `--set-network custom` support.
+- Custom RPC mode uses standard RPC for SOL balances, history, simulation, and sends; Helius DAS token/NFT metadata is explicitly unavailable there.
+- Mainnet/devnet Helius behavior remains unchanged.
+- Updated SPEC.md, README.md, and architecture docs.
+Checks:
+- cargo fmt: passed
+- cargo test: passed (0 tests; warnings)
+- cargo build: passed (warnings)
+- cargo clippy: passed with warnings
+Commit: pending in this run.
+Blockers: none.
+
+## #15 Refactor src/main.rs into focused modules
+Status: partially completed.
+Changes:
+- Extracted Den theme loading/hot-reload code into `src/theme.rs`.
+- Left app state, CLI, network, wallet, contacts, and UI rendering in `src/main.rs` to avoid a risky broad rewrite in this pass.
+- Updated architecture docs and AGENT.md.
+Checks:
+- cargo fmt: passed
+- cargo test: passed (0 tests; warnings)
+- cargo build: passed (warnings)
+- cargo clippy: passed with warnings
+Commit: pending in this run.
+Blockers: further modularization should be done as smaller follow-up PRs/modules.
 

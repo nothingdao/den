@@ -2,16 +2,16 @@
 
 ## Structure
 
-Den is currently implemented primarily in `src/main.rs`. Application state, TUI rendering, CLI handling, config logic, wallet management, contacts, and Helius fetches all live there.
+Den is currently implemented primarily in `src/main.rs`, with theme loading isolated in `src/theme.rs`. Application state, TUI rendering, CLI handling, config logic, wallet management, contacts, and network fetches still mostly live in the main module.
 
 ## Major Subsystems
 
 - TUI: Ratatui/Crossterm rendering, keyboard handling, tabs, modals
 - CLI: headless wallet/config/contact commands exposed through `den --help`
-- Wallets: full wallets and watch-only wallets, with active-wallet selection
+- Wallets: full wallets and watch-only wallets, with active-wallet selection, random key generation, and 12-word seed phrase create/restore
 - Config: local file backend plus optional Bitwarden-backed sync
 - Contacts: persisted contact list with JSON import/export
-- Network data: Helius requests for balances, tokens, and history run on a background refresh worker
+- Network data: Helius requests for balances, tokens, NFTs, and history run on a background refresh worker; custom RPC supports standard RPC balance/history/sends without DAS metadata
 - Transactions: send flows build legacy SOL/SPL Token transactions, simulate before review, then sign/broadcast only after typed confirmation
 - Release: GitHub Actions builds macOS binaries and publishes release assets used by Homebrew
 
@@ -21,7 +21,7 @@ Core app state includes:
 
 - active tab and selection state
 - wallet list and active wallet
-- token/history/account data
+- token/NFT/history/account data
 - onboarding/setup state
 - status messaging
 - current network
@@ -34,7 +34,7 @@ Typical refresh flow:
 ```text
 user action
 -> resolve active wallet + config
--> build RPC/DAS requests
+-> build RPC/DAS requests, or standard RPC-only requests for custom endpoints
 -> enqueue background refresh worker
 -> fetch balances/tokens/history via blocking reqwest off the UI thread
 -> send refreshed snapshot back over a channel
@@ -57,13 +57,14 @@ Send tab
 -> sign and broadcast with preflight enabled
 ```
 
-Watch-only wallets are blocked before send entry. Token2022 sends are intentionally blocked until asset support is validated.
+Watch-only wallets are blocked before send entry. Token2022/non-SPL Token sends are intentionally blocked; assets from unsupported programs are marked in the asset view.
 
 ## Storage
 
 ### Secrets
 
 - Private keys live in macOS Keychain via `keyring`
+- Seed phrases for mnemonic-created/restored wallets are also stored in Keychain and only revealed after typing `REVEAL`
 
 ### Config
 
@@ -79,7 +80,7 @@ Watch-only wallets are blocked before send entry. Token2022 sends are intentiona
 
 The shipped CLI includes:
 
-- wallet management commands
+- wallet management commands, including random key generation and seed phrase restore
 - contact import/export/list commands
 - config/network status commands
 - legacy `--import`

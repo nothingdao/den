@@ -1,8 +1,5 @@
-use std::cell::Cell;
 use std::error::Error;
-use std::fs;
 use std::io::{self, Write};
-use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::str::FromStr;
 use std::sync::{Mutex, OnceLock, mpsc};
@@ -10,6 +7,7 @@ use std::thread;
 use std::time::{Duration, SystemTime};
 
 use base64::{Engine as _, engine::general_purpose};
+use bip39::{Language, Mnemonic};
 use chrono::Utc;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use crossterm::execute;
@@ -19,14 +17,13 @@ use crossterm::terminal::{
 use qrcode::QrCode;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::prelude::{Backend, CrosstermBackend, Terminal};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{
-    Axis, Block, BorderType, Borders, Chart, Dataset, GraphType, List, ListItem, Paragraph, Row,
-    Table, Tabs,
-};
+use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph, Row, Table, Tabs};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use solana_derivation_path::DerivationPath;
+use solana_keypair::seed_derivable::keypair_from_seed_and_derivation_path;
 use solana_sdk::hash::Hash;
 use solana_sdk::instruction::Instruction;
 use solana_sdk::pubkey::Pubkey;
@@ -45,191 +42,15 @@ const BOOTSTRAP_FILE_NAME: &str = "bootstrap.json";
 const CONTACTS_FILE_NAME: &str = "contacts.json";
 const CONFIG_BACKEND_ENV: &str = "DEN_CONFIG_BACKEND";
 const BW_CONFIG_ITEM_ID_ENV: &str = "DEN_BW_CONFIG_ITEM_ID";
+const RAW_KEY_ORIGIN: &str = "raw";
+const MNEMONIC_KEY_ORIGIN: &str = "mnemonic";
+const DEFAULT_DERIVATION_PATH: &str = "m/44'/501'/0'/0'";
 
 static CONFIG_REV: OnceLock<Mutex<Option<String>>> = OnceLock::new();
 static BW_SESSION_CACHE: OnceLock<Mutex<Option<String>>> = OnceLock::new();
 
-// ── Theme ─────────────────────────────────────────────────────────────────────
-
-const THEME_FILE_NAME: &str = "theme.toml";
-
-#[derive(serde::Deserialize)]
-struct DenThemeConfig {
-    #[serde(default = "den_default_bg")]
-    bg: String,
-    #[serde(default = "den_default_fg")]
-    fg: String,
-    #[serde(default = "den_default_accent")]
-    accent: String,
-    #[serde(default = "den_default_sel_fg")]
-    sel_fg: String,
-    #[serde(default = "den_default_fg_dim")]
-    fg_dim: String,
-    #[serde(default = "den_default_fg_xdim")]
-    fg_xdim: String,
-    #[serde(default = "den_default_border")]
-    border: String,
-    #[serde(default = "den_default_surface")]
-    surface: String,
-    #[serde(default = "den_default_green")]
-    green: String,
-    #[serde(default = "den_default_red")]
-    red: String,
-    #[serde(default = "den_default_yellow")]
-    yellow: String,
-}
-
-fn den_default_bg() -> String {
-    "#101010".into()
-}
-fn den_default_fg() -> String {
-    "#ffffff".into()
-}
-fn den_default_accent() -> String {
-    "#e8b887".into()
-}
-fn den_default_sel_fg() -> String {
-    "#101010".into()
-}
-fn den_default_fg_dim() -> String {
-    "#A0A0A0".into()
-}
-fn den_default_fg_xdim() -> String {
-    "#7E7E7E".into()
-}
-fn den_default_border() -> String {
-    "#232323".into()
-}
-fn den_default_surface() -> String {
-    "#1C1C1C".into()
-}
-fn den_default_green() -> String {
-    "#90b99f".into()
-}
-fn den_default_red() -> String {
-    "#f5a191".into()
-}
-fn den_default_yellow() -> String {
-    "#e6b99d".into()
-}
-
-#[derive(serde::Deserialize)]
-struct DenThemeFile {
-    #[serde(default)]
-    theme: DenThemeConfig,
-}
-
-impl Default for DenThemeFile {
-    fn default() -> Self {
-        Self {
-            theme: DenThemeConfig::default(),
-        }
-    }
-}
-
-impl Default for DenThemeConfig {
-    fn default() -> Self {
-        Self {
-            bg: den_default_bg(),
-            fg: den_default_fg(),
-            accent: den_default_accent(),
-            sel_fg: den_default_sel_fg(),
-            fg_dim: den_default_fg_dim(),
-            fg_xdim: den_default_fg_xdim(),
-            border: den_default_border(),
-            surface: den_default_surface(),
-            green: den_default_green(),
-            red: den_default_red(),
-            yellow: den_default_yellow(),
-        }
-    }
-}
-
-#[derive(Clone, Copy)]
-struct DenTheme {
-    bg: Color,
-    fg: Color,
-    accent: Color,
-    sel_fg: Color,
-    fg_dim: Color,
-    fg_xdim: Color,
-    border: Color,
-    surface: Color,
-    green: Color,
-    red: Color,
-    yellow: Color,
-}
-
-thread_local! {
-    static DEN_THEME: Cell<Option<DenTheme>> = Cell::new(None);
-}
-
-fn theme() -> DenTheme {
-    DEN_THEME.with(|c| c.get().unwrap_or_else(default_den_theme))
-}
-
-fn default_den_theme() -> DenTheme {
-    den_theme_from_config(&DenThemeConfig::default())
-}
-
-fn den_theme_from_config(cfg: &DenThemeConfig) -> DenTheme {
-    DenTheme {
-        bg: den_hex_color(&cfg.bg),
-        fg: den_hex_color(&cfg.fg),
-        accent: den_hex_color(&cfg.accent),
-        sel_fg: den_hex_color(&cfg.sel_fg),
-        fg_dim: den_hex_color(&cfg.fg_dim),
-        fg_xdim: den_hex_color(&cfg.fg_xdim),
-        border: den_hex_color(&cfg.border),
-        surface: den_hex_color(&cfg.surface),
-        green: den_hex_color(&cfg.green),
-        red: den_hex_color(&cfg.red),
-        yellow: den_hex_color(&cfg.yellow),
-    }
-}
-
-fn den_hex_color(hex: &str) -> Color {
-    let h = hex.trim_start_matches('#');
-    let r = u8::from_str_radix(&h[0..2], 16).unwrap_or(255);
-    let g = u8::from_str_radix(&h[2..4], 16).unwrap_or(255);
-    let b = u8::from_str_radix(&h[4..6], 16).unwrap_or(255);
-    Color::Rgb(r, g, b)
-}
-
-fn den_theme_path() -> Option<PathBuf> {
-    dirs::config_dir().map(|d| d.join(CONFIG_DIR_NAME).join(THEME_FILE_NAME))
-}
-
-fn init_den_theme() {
-    if let Some(path) = den_theme_path() {
-        if let Ok(s) = fs::read_to_string(&path) {
-            if let Ok(file) = toml::from_str::<DenThemeFile>(&s) {
-                DEN_THEME.with(|c| c.set(Some(den_theme_from_config(&file.theme))));
-                return;
-            }
-        }
-    }
-    DEN_THEME.with(|c| c.set(Some(default_den_theme())));
-}
-
-fn reload_den_theme_if_changed(mtime: &mut Option<SystemTime>) {
-    let Some(path) = den_theme_path() else { return };
-    let Ok(meta) = fs::metadata(&path) else {
-        return;
-    };
-    let Ok(modified) = meta.modified() else {
-        return;
-    };
-    if mtime.map_or(true, |last| modified > last) {
-        *mtime = Some(modified);
-        if let Ok(s) = fs::read_to_string(&path) {
-            if let Ok(file) = toml::from_str::<DenThemeFile>(&s) {
-                DEN_THEME.with(|c| c.set(Some(den_theme_from_config(&file.theme))));
-            }
-        }
-    }
-}
-
+mod theme;
+use theme::{init_den_theme, reload_den_theme_if_changed, theme};
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Tab {
     Overview,
@@ -277,7 +98,6 @@ struct Token {
     symbol: String,
     balance: String,
     value: String,
-    history: Vec<f64>,
     mint: Option<String>,
     decimals: u8,
     token_program: Option<String>,
@@ -292,6 +112,13 @@ struct Account {
     has_key: bool,
     is_active: bool,
     added_at: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct Nft {
+    name: String,
+    collection: String,
+    address: String,
 }
 
 #[derive(Clone, Debug)]
@@ -351,25 +178,29 @@ fn default_contacts_version() -> u32 {
 struct WalletData {
     sol_balance: f64,
     tokens: Vec<Token>,
+    nfts: Vec<Nft>,
     history: Vec<Transaction>,
 }
 
 struct Config {
     address: String,
     rpc_url: String,
+    supports_das: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Network {
     Mainnet,
     Devnet,
+    Custom,
 }
 
 impl Network {
     fn toggle(self) -> Self {
         match self {
             Network::Mainnet => Network::Devnet,
-            Network::Devnet => Network::Mainnet,
+            Network::Devnet => Network::Custom,
+            Network::Custom => Network::Mainnet,
         }
     }
 
@@ -377,6 +208,7 @@ impl Network {
         match self {
             Network::Mainnet => "Mainnet",
             Network::Devnet => "Devnet",
+            Network::Custom => "Custom",
         }
     }
 }
@@ -414,8 +246,16 @@ struct WalletEntry {
     address: String,
     #[serde(default)]
     has_key: bool,
+    #[serde(default = "default_key_origin")]
+    key_origin: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    derivation_path: Option<String>,
     #[serde(default)]
     added_at: Option<String>,
+}
+
+fn default_key_origin() -> String {
+    RAW_KEY_ORIGIN.to_string()
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -430,6 +270,8 @@ struct NetworkConfig {
     default: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     api_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    custom_rpc_url: Option<String>,
 }
 
 impl Default for NetworkConfig {
@@ -437,6 +279,7 @@ impl Default for NetworkConfig {
         Self {
             default: default_network(),
             api_key: None,
+            custom_rpc_url: None,
         }
     }
 }
@@ -979,6 +822,12 @@ fn migrate_config_if_needed(config: &mut DenConfig) -> bool {
         name: "Main".to_string(),
         address,
         has_key,
+        key_origin: if has_key {
+            RAW_KEY_ORIGIN.to_string()
+        } else {
+            "watch".to_string()
+        },
+        derivation_path: None,
         added_at: None,
     });
     config.active_wallet = Some(wallet_id);
@@ -1103,6 +952,12 @@ enum InputMode {
     SendRecipient,
     SendAmount,
     ConfirmSend,
+    GenerateWalletName,
+    GenerateMnemonicName,
+    RestoreMnemonicName,
+    RestoreMnemonicPhrase,
+    ConfirmMnemonicSaved,
+    RevealSecretConfirm,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1127,6 +982,20 @@ struct ImportState {
     wallet_name: String,
 }
 
+struct PendingMnemonicWallet {
+    name: String,
+    mnemonic: String,
+    secret: String,
+    address: String,
+    derivation_path: String,
+}
+
+struct RevealedSecret {
+    label: String,
+    value: String,
+    kind: String,
+}
+
 #[derive(Clone, Debug)]
 struct RefreshSnapshot {
     accounts: Vec<Account>,
@@ -1134,6 +1003,7 @@ struct RefreshSnapshot {
     wallet_address: String,
     total_balance: String,
     tokens: Vec<Token>,
+    nfts: Vec<Nft>,
     history: Vec<Transaction>,
     keystore_status: String,
     api_key_status: String,
@@ -1156,6 +1026,7 @@ struct App {
     total_balance: String,
     wallet_address: String,
     active_wallet_id: Option<String>,
+    nfts: Vec<Nft>,
     status: String,
     keystore_status: String,
     api_key_status: String,
@@ -1171,6 +1042,8 @@ struct App {
     last_signature: String,
     send_recipient: String,
     pending_send: Option<SendReview>,
+    pending_mnemonic: Option<PendingMnemonicWallet>,
+    revealed_secret: Option<RevealedSecret>,
     refresh_tx: mpsc::Sender<RefreshMessage>,
     refresh_rx: mpsc::Receiver<RefreshMessage>,
     refresh_in_flight: bool,
@@ -1196,6 +1069,7 @@ impl App {
             total_balance: "0.00 SOL".to_string(),
             wallet_address: "Unset".to_string(),
             active_wallet_id: None,
+            nfts: Vec::new(),
             status: "Add a wallet: press 'a' on Accounts tab or run: den --add-wallet <name>"
                 .to_string(),
             keystore_status: "Keychain: no wallets".to_string(),
@@ -1214,6 +1088,8 @@ impl App {
             last_signature: "-".to_string(),
             send_recipient: String::new(),
             pending_send: None,
+            pending_mnemonic: None,
+            revealed_secret: None,
             refresh_tx,
             refresh_rx,
             refresh_in_flight: false,
@@ -1229,23 +1105,13 @@ impl App {
         }
     }
 
-    fn apply_active_data(&mut self, data: WalletData) {
-        self.total_balance = format!("{:.4} SOL", data.sol_balance);
-        self.tokens = data.tokens;
-        self.history = if data.history.is_empty() {
-            vec![placeholder_transaction()]
-        } else {
-            data.history
-        };
-        self.status = "Live data from Helius".to_string();
-    }
-
     fn apply_refresh_snapshot(&mut self, snapshot: RefreshSnapshot) {
         self.accounts = snapshot.accounts;
         self.active_wallet_id = snapshot.active_wallet_id;
         self.wallet_address = snapshot.wallet_address;
         self.total_balance = snapshot.total_balance;
         self.tokens = snapshot.tokens;
+        self.nfts = snapshot.nfts;
         self.history = snapshot.history;
         self.keystore_status = snapshot.keystore_status;
         self.api_key_status = snapshot.api_key_status;
@@ -1304,6 +1170,14 @@ impl App {
     }
 
     fn copy_context_to_clipboard(&mut self) {
+        if let Some(secret) = &self.revealed_secret {
+            match copy_to_clipboard(&secret.value) {
+                Ok(_) => self.status = format!("Copied {} to clipboard", secret.kind),
+                Err(err) => self.status = format!("Clipboard copy failed: {}", err),
+            }
+            return;
+        }
+
         let target = match self.tab {
             Tab::Accounts => self
                 .accounts
@@ -1352,6 +1226,16 @@ impl App {
 
         if self.input_mode != InputMode::None {
             self.handle_input_mode(code);
+            return;
+        }
+
+        if self.revealed_secret.is_some() {
+            match code {
+                KeyCode::Esc => self.revealed_secret = None,
+                KeyCode::Char('c') => self.copy_context_to_clipboard(),
+                KeyCode::Char('q') => self.should_quit = true,
+                _ => {}
+            }
             return;
         }
 
@@ -1406,6 +1290,33 @@ impl App {
                     self.input_mode = InputMode::AddWatchOnlyName;
                     self.input_buffer.clear();
                     self.import_state.wallet_name.clear();
+                }
+            }
+            KeyCode::Char('g') => {
+                if self.tab == Tab::Accounts {
+                    self.input_mode = InputMode::GenerateWalletName;
+                    self.input_buffer.clear();
+                    self.import_state.wallet_name.clear();
+                }
+            }
+            KeyCode::Char('m') => {
+                if self.tab == Tab::Accounts {
+                    self.input_mode = InputMode::GenerateMnemonicName;
+                    self.input_buffer.clear();
+                    self.import_state.wallet_name.clear();
+                }
+            }
+            KeyCode::Char('p') => {
+                if self.tab == Tab::Accounts {
+                    self.input_mode = InputMode::RestoreMnemonicName;
+                    self.input_buffer.clear();
+                    self.import_state.wallet_name.clear();
+                }
+            }
+            KeyCode::Char('x') => {
+                if self.tab == Tab::Accounts && !self.accounts.is_empty() {
+                    self.input_mode = InputMode::RevealSecretConfirm;
+                    self.input_buffer.clear();
                 }
             }
             KeyCode::Char('e') => {
@@ -1545,12 +1456,14 @@ impl App {
             self.status = format!("Cannot send: '{}' is watch-only", wallet.name);
             return;
         }
-        let Some(api_key) = resolve_api_key(&config) else {
-            self.status = "Cannot send: API key not configured".to_string();
-            return;
+        let rpc_url = match rpc_url_for_network(&config, self.network) {
+            Ok(url) => url,
+            Err(err) => {
+                self.status = format!("Cannot send: {}", err);
+                return;
+            }
         };
         let token = self.selected_send_token();
-        let rpc_url = build_rpc_url(&api_key, self.network);
         match build_send_review(
             &wallet,
             &token,
@@ -1571,6 +1484,40 @@ impl App {
         }
     }
 
+    fn reveal_selected_wallet_secret(&mut self) -> Result<(), Box<dyn Error>> {
+        let Some(account) = self.accounts.get(self.selected_account) else {
+            return Err("no selected wallet".into());
+        };
+        if !account.has_key {
+            return Err("watch-only wallets do not have secrets".into());
+        }
+
+        let config = load_den_config();
+        let wallet = config
+            .wallets
+            .iter()
+            .find(|wallet| wallet.id == account.id)
+            .ok_or("wallet not found")?;
+
+        if wallet.key_origin == MNEMONIC_KEY_ORIGIN {
+            let mnemonic = load_mnemonic_for_wallet(&wallet.id)?;
+            self.revealed_secret = Some(RevealedSecret {
+                label: wallet.name.clone(),
+                value: mnemonic,
+                kind: "seed phrase".to_string(),
+            });
+        } else {
+            let secret = load_secret_for_wallet(&wallet.id)?;
+            let keypair = keypair_from_secret(&secret)?;
+            self.revealed_secret = Some(RevealedSecret {
+                label: wallet.name.clone(),
+                value: keypair_to_base58_secret(&keypair),
+                kind: "private key".to_string(),
+            });
+        }
+        Ok(())
+    }
+
     fn confirm_pending_send(&mut self, input: &str) {
         if input != "SEND" {
             self.status = "Send cancelled".to_string();
@@ -1581,11 +1528,13 @@ impl App {
             return;
         };
         let config = load_den_config();
-        let Some(api_key) = resolve_api_key(&config) else {
-            self.status = "Send failed: API key not configured".to_string();
-            return;
+        let rpc_url = match rpc_url_for_network(&config, review.network) {
+            Ok(url) => url,
+            Err(err) => {
+                self.status = format!("Send failed: {}", err);
+                return;
+            }
         };
-        let rpc_url = build_rpc_url(&api_key, review.network);
         match broadcast_send(&review, &rpc_url) {
             Ok(signature) => {
                 self.last_signature = signature.clone();
@@ -1810,6 +1759,10 @@ impl App {
     fn handle_input_mode(&mut self, code: KeyCode) {
         match code {
             KeyCode::Esc => {
+                if self.input_mode == InputMode::ConfirmMnemonicSaved {
+                    self.pending_mnemonic = None;
+                    self.status = "Mnemonic wallet cancelled; no key was stored".to_string();
+                }
                 self.input_mode = InputMode::None;
                 self.input_buffer.clear();
             }
@@ -1847,6 +1800,8 @@ impl App {
                                                 name: name.clone(),
                                                 address,
                                                 has_key: true,
+                                                key_origin: RAW_KEY_ORIGIN.to_string(),
+                                                derivation_path: None,
                                                 added_at: Some(
                                                     Utc::now().format("%Y-%m-%d").to_string(),
                                                 ),
@@ -1892,6 +1847,8 @@ impl App {
                                 name: name.clone(),
                                 address: input,
                                 has_key: false,
+                                key_origin: "watch".to_string(),
+                                derivation_path: None,
                                 added_at: Some(Utc::now().format("%Y-%m-%d").to_string()),
                             });
                             if config.active_wallet.is_none() {
@@ -1901,6 +1858,101 @@ impl App {
                             let msg = format!("Watch-only wallet '{}' added", name);
                             self.start_refresh();
                             self.status = msg;
+                        }
+                    }
+                    InputMode::GenerateWalletName => {
+                        if input.is_empty() {
+                            self.status = "Generate cancelled".to_string();
+                        } else {
+                            match create_random_wallet(&input) {
+                                Ok(address) => {
+                                    self.start_refresh();
+                                    self.status = format!(
+                                        "Generated wallet '{}' ({})",
+                                        input,
+                                        short_address(&address)
+                                    );
+                                }
+                                Err(err) => self.status = format!("Generate failed: {}", err),
+                            }
+                        }
+                    }
+                    InputMode::GenerateMnemonicName => {
+                        if input.is_empty() {
+                            self.status = "Mnemonic wallet cancelled".to_string();
+                        } else {
+                            match prepare_mnemonic_wallet(&input) {
+                                Ok(pending) => {
+                                    self.pending_mnemonic = Some(pending);
+                                    self.input_mode = InputMode::ConfirmMnemonicSaved;
+                                    self.input_buffer.clear();
+                                    self.status =
+                                        "Back up the seed phrase, then type I SAVED IT".to_string();
+                                    return;
+                                }
+                                Err(err) => self.status = format!("Mnemonic failed: {}", err),
+                            }
+                        }
+                    }
+                    InputMode::RestoreMnemonicName => {
+                        if input.is_empty() {
+                            self.status = "Mnemonic restore cancelled".to_string();
+                        } else {
+                            self.import_state.wallet_name = input;
+                            self.input_mode = InputMode::RestoreMnemonicPhrase;
+                            self.input_buffer.clear();
+                            return;
+                        }
+                    }
+                    InputMode::RestoreMnemonicPhrase => {
+                        if input.is_empty() {
+                            self.status = "Mnemonic restore cancelled".to_string();
+                        } else {
+                            match restore_mnemonic_wallet(&self.import_state.wallet_name, &input) {
+                                Ok(address) => {
+                                    self.start_refresh();
+                                    self.status = format!(
+                                        "Mnemonic wallet restored ({})",
+                                        short_address(&address)
+                                    );
+                                }
+                                Err(err) => {
+                                    self.status = format!("Mnemonic restore failed: {}", err)
+                                }
+                            }
+                        }
+                    }
+                    InputMode::ConfirmMnemonicSaved => {
+                        if input != "I SAVED IT" {
+                            self.pending_mnemonic = None;
+                            self.status =
+                                "Mnemonic wallet cancelled; no key was stored".to_string();
+                        } else if let Some(pending) = self.pending_mnemonic.take() {
+                            match store_mnemonic_wallet(pending) {
+                                Ok(address) => {
+                                    self.start_refresh();
+                                    self.status = format!(
+                                        "Mnemonic wallet stored ({})",
+                                        short_address(&address)
+                                    );
+                                }
+                                Err(err) => self.status = format!("Mnemonic store failed: {}", err),
+                            }
+                        } else {
+                            self.status = "No pending mnemonic wallet".to_string();
+                        }
+                    }
+                    InputMode::RevealSecretConfirm => {
+                        if input != "REVEAL" {
+                            self.status = "Secret reveal cancelled".to_string();
+                        } else {
+                            match self.reveal_selected_wallet_secret() {
+                                Ok(_) => {
+                                    self.status = "Secret revealed; press c to copy or Esc to close"
+                                        .to_string()
+                                }
+                                Err(err) => self.status = format!("Reveal failed: {}", err),
+                            }
                         }
                     }
                     InputMode::RenameWallet => {
@@ -1931,6 +1983,7 @@ impl App {
                             }
                             if had_key {
                                 let _ = clear_secret_for_wallet(&wallet_id);
+                                let _ = clear_mnemonic_for_wallet(&wallet_id);
                             }
                             let _ = save_den_config(&config);
                             self.selected_account = 0;
@@ -2209,6 +2262,7 @@ fn build_app() -> App {
 
     let default_network = match den_config.network.default.as_str() {
         "devnet" => Network::Devnet,
+        "custom" => Network::Custom,
         _ => Network::Mainnet,
     };
 
@@ -2225,14 +2279,6 @@ fn build_app() -> App {
     app.start_refresh();
 
     app
-}
-
-fn bordered<'a>(title: &'a str) -> Block<'a> {
-    Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(theme().border))
-        .title(title)
 }
 
 fn ui(frame: &mut ratatui::prelude::Frame, app: &App) {
@@ -2273,8 +2319,12 @@ fn ui(frame: &mut ratatui::prelude::Frame, app: &App) {
 
     if app.onboarding.active {
         render_onboarding_modal(frame, app);
+    } else if app.input_mode == InputMode::ConfirmMnemonicSaved {
+        render_mnemonic_confirm_modal(frame, app);
     } else if app.input_mode != InputMode::None {
         render_input_modal(frame, app);
+    } else if app.revealed_secret.is_some() {
+        render_revealed_secret_modal(frame, app);
     }
 }
 
@@ -2483,7 +2533,7 @@ fn render_accounts(frame: &mut ratatui::prelude::Frame, area: Rect, app: &App) {
         Block::default()
             .borders(Borders::ALL)
             .border_style(Style::default().fg(theme().border))
-            .title("Wallets [Enter:details a:add w:watch e:rename d:delete]"),
+            .title("Wallets [a:import g:generate m:seed p:restore w:watch x:reveal]"),
     )
     .row_highlight_style(
         Style::default()
@@ -2520,10 +2570,22 @@ fn render_wallet_detail(frame: &mut ratatui::prelude::Frame, area: Rect, app: &A
     };
     let active_status = if account.is_active { "Yes" } else { "No" };
     let added_display = account.added_at.as_deref().unwrap_or("Unknown");
+    let config = load_den_config();
+    let wallet_config = config.wallets.iter().find(|wallet| wallet.id == account.id);
+    let origin_display = wallet_config
+        .map(|wallet| wallet.key_origin.as_str())
+        .unwrap_or(if account.has_key {
+            RAW_KEY_ORIGIN
+        } else {
+            "watch"
+        });
+    let derivation_display = wallet_config
+        .and_then(|wallet| wallet.derivation_path.as_deref())
+        .unwrap_or("-");
 
     let layout = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(14), Constraint::Min(0)])
+        .constraints([Constraint::Length(18), Constraint::Min(0)])
         .split(area);
 
     let info = Text::from(vec![
@@ -2557,6 +2619,16 @@ fn render_wallet_detail(frame: &mut ratatui::prelude::Frame, area: Rect, app: &A
                     theme().fg_dim
                 }),
             ),
+        ]),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("  Origin:   ", Style::default().fg(theme().fg_dim)),
+            Span::styled(origin_display, Style::default().fg(theme().fg)),
+        ]),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("  Path:     ", Style::default().fg(theme().fg_dim)),
+            Span::styled(derivation_display, Style::default().fg(theme().fg)),
         ]),
         Line::from(""),
         Line::from(vec![
@@ -2595,6 +2667,18 @@ fn render_wallet_detail(frame: &mut ratatui::prelude::Frame, area: Rect, app: &A
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled("      Rename wallet", Style::default().fg(theme().fg)),
+        ]),
+        Line::from(vec![
+            Span::styled(
+                "  x",
+                Style::default()
+                    .fg(theme().accent)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                "      Reveal backup secret (requires REVEAL)",
+                Style::default().fg(theme().fg),
+            ),
         ]),
         Line::from(vec![
             Span::styled(
@@ -2653,19 +2737,21 @@ fn render_tokens_table(frame: &mut ratatui::prelude::Frame, area: Rect, app: &Ap
             ratatui::widgets::Cell::from(token.symbol.clone()),
             ratatui::widgets::Cell::from(token.balance.clone()),
             ratatui::widgets::Cell::from(token.value.clone()),
+            ratatui::widgets::Cell::from(token_program_label(token)),
         ])
     });
 
     let table = Table::new(
         rows,
         [
-            Constraint::Percentage(30),
-            Constraint::Percentage(35),
-            Constraint::Percentage(35),
+            Constraint::Percentage(25),
+            Constraint::Percentage(25),
+            Constraint::Percentage(25),
+            Constraint::Percentage(25),
         ],
     )
     .header(
-        Row::new(vec!["Token", "Balance", "Value"]).style(
+        Row::new(vec!["Token", "Balance", "Value", "Program"]).style(
             Style::default()
                 .fg(theme().accent)
                 .bg(theme().surface)
@@ -2691,59 +2777,53 @@ fn render_tokens_table(frame: &mut ratatui::prelude::Frame, area: Rect, app: &Ap
 
 fn render_token_chart(frame: &mut ratatui::prelude::Frame, area: Rect, app: &App) {
     let token = app.tokens.get(app.selected_token).or(app.tokens.first());
-    let (title, history) = match token {
-        Some(token) => (
-            format!("{} price (24h)", token.symbol),
-            token.history.as_slice(),
-        ),
-        None => ("Token price (24h)".to_string(), &[][..]),
-    };
+    let mut lines = Vec::new();
 
-    let data = history
-        .iter()
-        .enumerate()
-        .map(|(index, value)| (index as f64, *value))
-        .collect::<Vec<(f64, f64)>>();
+    if let Some(token) = token {
+        lines.push(Line::from(vec![
+            Span::styled("Selected asset: ", Style::default().fg(theme().fg_dim)),
+            Span::styled(&token.symbol, Style::default().fg(theme().fg)),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled("Program: ", Style::default().fg(theme().fg_dim)),
+            Span::styled(token_program_label(token), Style::default().fg(theme().fg)),
+        ]));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(
+        "Charts: unavailable (real historical portfolio data not configured).",
+    ));
+    lines.push(Line::from("No seeded/fake chart data is shown."));
+    lines.push(Line::from(""));
+    lines.push(Line::from(format!("NFTs detected: {}", app.nfts.len())));
+    for nft in app.nfts.iter().take(5) {
+        let collection = if nft.collection == "-" {
+            String::new()
+        } else {
+            format!(" [{}]", short_address(&nft.collection))
+        };
+        lines.push(Line::from(format!(
+            "• {}{} {}",
+            nft.name,
+            collection,
+            short_address(&nft.address)
+        )));
+    }
+    if app.nfts.len() > 5 {
+        lines.push(Line::from(format!("…and {} more", app.nfts.len() - 5)));
+    }
 
-    let (min, max) = series_bounds(history);
-    let x_max = history.len().saturating_sub(1).max(1) as f64;
-
-    let dataset = Dataset::default()
-        .name("price")
-        .marker(ratatui::symbols::Marker::Dot)
-        .graph_type(GraphType::Line)
-        .style(Style::default().fg(theme().accent))
-        .data(&data);
-
-    let chart = Chart::new(vec![dataset])
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(theme().border))
-                .title(title),
-        )
-        .x_axis(
-            Axis::default()
-                .title("time")
-                .style(Style::default().fg(theme().fg_dim))
-                .bounds([0.0, x_max])
-                .labels([
-                    Span::styled("24h", Style::default().fg(theme().fg_dim)),
-                    Span::styled("now", Style::default().fg(theme().fg_dim)),
-                ]),
-        )
-        .y_axis(
-            Axis::default()
-                .title("price")
-                .style(Style::default().fg(theme().fg_dim))
-                .bounds([min, max])
-                .labels([
-                    Span::styled(format!("{:.2}", min), Style::default().fg(theme().fg_dim)),
-                    Span::styled(format!("{:.2}", max), Style::default().fg(theme().fg_dim)),
-                ]),
-        );
-
-    frame.render_widget(chart, area);
+    frame.render_widget(
+        Paragraph::new(Text::from(lines))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(theme().border))
+                    .title("Asset details"),
+            )
+            .style(Style::default().fg(theme().fg)),
+        area,
+    );
 }
 
 fn render_history(frame: &mut ratatui::prelude::Frame, area: Rect, app: &App) {
@@ -3247,10 +3327,17 @@ fn render_settings(frame: &mut ratatui::prelude::Frame, area: Rect, app: &App) {
     let full_count = app.accounts.iter().filter(|a| a.has_key).count();
     let watch_count = wallet_count - full_count;
 
+    let config = load_den_config();
+    let custom_rpc = config
+        .network
+        .custom_rpc_url
+        .as_deref()
+        .unwrap_or("not set");
+
     let layout = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(10),
+            Constraint::Length(11),
             Constraint::Length(10),
             Constraint::Min(0),
         ])
@@ -3269,6 +3356,10 @@ fn render_settings(frame: &mut ratatui::prelude::Frame, area: Rect, app: &App) {
         Line::from(vec![
             Span::styled("  API Key:    ", Style::default().fg(theme().fg_dim)),
             Span::styled(&app.api_key_status, Style::default().fg(theme().fg)),
+        ]),
+        Line::from(vec![
+            Span::styled("  Custom RPC: ", Style::default().fg(theme().fg_dim)),
+            Span::styled(custom_rpc, Style::default().fg(theme().fg)),
         ]),
         Line::from(vec![
             Span::styled("  Config:     ", Style::default().fg(theme().fg_dim)),
@@ -3406,10 +3497,10 @@ fn render_settings(frame: &mut ratatui::prelude::Frame, area: Rect, app: &App) {
 fn footer_nav_text(tab: Tab, in_detail: bool) -> &'static str {
     match tab {
         Tab::Accounts if in_detail => {
-            "Enter:activate | c:copy | e:rename | d:delete | Esc:back | q:quit"
+            "Enter:activate | c:copy | x:reveal | e:rename | d:delete | Esc:back | q:quit"
         }
         Tab::Accounts => {
-            "Enter:details | c:copy | a:add | w:watch | e:rename | d:delete | r:refresh | q:quit"
+            "Enter:details | c:copy | a:import | g:generate | m:seed | p:restore | w:watch | q:quit"
         }
         Tab::Send if in_detail => "Review: Enter then type SEND to broadcast | Esc:cancel | q:quit",
         Tab::Send => "up/down:asset | Enter:send flow | q:quit",
@@ -3616,6 +3707,87 @@ fn render_onboarding_modal(frame: &mut ratatui::prelude::Frame, app: &App) {
     frame.render_widget(paragraph, modal);
 }
 
+fn render_mnemonic_confirm_modal(frame: &mut ratatui::prelude::Frame, app: &App) {
+    let area = frame.area();
+    let modal_width = area.width.saturating_sub(8).min(92).max(40);
+    let modal_height = 15u16.min(area.height.saturating_sub(2).max(8));
+    let x = area.x + (area.width.saturating_sub(modal_width)) / 2;
+    let y = area.y + (area.height.saturating_sub(modal_height)) / 2;
+    let modal = Rect::new(x, y, modal_width, modal_height);
+
+    let pending = app.pending_mnemonic.as_ref();
+    let phrase = pending
+        .map(|pending| pending.mnemonic.as_str())
+        .unwrap_or("seed phrase unavailable");
+    let name = pending
+        .map(|pending| pending.name.as_str())
+        .unwrap_or("wallet");
+    let derivation = pending
+        .map(|pending| pending.derivation_path.as_str())
+        .unwrap_or(DEFAULT_DERIVATION_PATH);
+
+    let content = Text::from(vec![
+        Line::from(format!("Wallet: {}", name)),
+        Line::from(format!("Derivation: {}", derivation)),
+        Line::from(""),
+        Line::from("Write this 12-word English seed phrase down now."),
+        Line::from("Den cannot recover it if you lose it."),
+        Line::from(""),
+        Line::from(phrase.to_string()),
+        Line::from(""),
+        Line::from("Type I SAVED IT to store the derived key in Keychain."),
+        Line::from(app.input_buffer.clone()),
+        Line::from("Esc cancels without storing."),
+    ]);
+
+    frame.render_widget(
+        Paragraph::new(content)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(theme().yellow))
+                    .title("Backup Seed Phrase"),
+            )
+            .style(Style::default().fg(theme().fg)),
+        modal,
+    );
+}
+
+fn render_revealed_secret_modal(frame: &mut ratatui::prelude::Frame, app: &App) {
+    let Some(secret) = &app.revealed_secret else {
+        return;
+    };
+    let area = frame.area();
+    let modal_width = area.width.saturating_sub(8).min(92).max(40);
+    let modal_height = 11u16.min(area.height.saturating_sub(2).max(7));
+    let x = area.x + (area.width.saturating_sub(modal_width)) / 2;
+    let y = area.y + (area.height.saturating_sub(modal_height)) / 2;
+    let modal = Rect::new(x, y, modal_width, modal_height);
+
+    let content = Text::from(vec![
+        Line::from(format!("Wallet: {}", secret.label)),
+        Line::from(format!("Secret type: {}", secret.kind)),
+        Line::from(""),
+        Line::from("Keep this secret. Anyone with it can spend funds."),
+        Line::from(""),
+        Line::from(secret.value.clone()),
+        Line::from(""),
+        Line::from("c copies to clipboard. Esc closes."),
+    ]);
+
+    frame.render_widget(
+        Paragraph::new(content)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(theme().red))
+                    .title("Secret Revealed"),
+            )
+            .style(Style::default().fg(theme().fg)),
+        modal,
+    );
+}
+
 fn render_input_modal(frame: &mut ratatui::prelude::Frame, app: &App) {
     let area = frame.area();
     let modal_width = area.width.saturating_sub(8).min(80).max(20);
@@ -3722,6 +3894,36 @@ fn render_input_modal(frame: &mut ratatui::prelude::Frame, app: &App) {
             "Type SEND to sign and broadcast:".to_string(),
             app.input_buffer.clone(),
         ),
+        InputMode::GenerateWalletName => (
+            "Generate Wallet",
+            "Enter a name for the new random keypair:".to_string(),
+            app.input_buffer.clone(),
+        ),
+        InputMode::GenerateMnemonicName => (
+            "Generate Seed Wallet",
+            "Enter a name for the new 12-word seed wallet:".to_string(),
+            app.input_buffer.clone(),
+        ),
+        InputMode::RestoreMnemonicName => (
+            "Restore Seed Wallet",
+            "Enter a name for the restored seed wallet:".to_string(),
+            app.input_buffer.clone(),
+        ),
+        InputMode::RestoreMnemonicPhrase => (
+            "Restore Seed Wallet",
+            "Paste the 12-word English seed phrase:".to_string(),
+            "*".repeat(app.input_buffer.len()),
+        ),
+        InputMode::ConfirmMnemonicSaved => (
+            "Backup Seed Phrase",
+            "Type I SAVED IT after backing up the phrase:".to_string(),
+            app.input_buffer.clone(),
+        ),
+        InputMode::RevealSecretConfirm => (
+            "Reveal Secret",
+            "Type REVEAL to display this wallet's secret:".to_string(),
+            app.input_buffer.clone(),
+        ),
         InputMode::None => ("", String::new(), String::new()),
     };
 
@@ -3765,7 +3967,7 @@ fn status_style(message: &str) -> Style {
     {
         Style::default().fg(theme().green)
     } else {
-        Style::default().fg(theme().fg_dim)
+        Style::default().fg(theme().fg_xdim)
     }
 }
 
@@ -3779,7 +3981,6 @@ fn placeholder_sol_token() -> Token {
         symbol: "SOL".to_string(),
         balance: "0.00".to_string(),
         value: "-".to_string(),
-        history: Vec::new(),
         mint: None,
         decimals: 9,
         token_program: None,
@@ -3795,49 +3996,6 @@ fn placeholder_transaction() -> Transaction {
         slot: 0,
         failed: false,
     }
-}
-
-fn seeded_series(seed: &str, length: usize) -> Vec<f64> {
-    let mut state: u64 = 1469598103934665603;
-    for byte in seed.as_bytes() {
-        state ^= *byte as u64;
-        state = state.wrapping_mul(1099511628211);
-    }
-
-    let mut values = Vec::with_capacity(length);
-    let mut current = (state % 1000) as f64 / 10.0 + 10.0;
-    for _ in 0..length {
-        state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
-        let change = ((state >> 33) as i64 % 11) as f64 / 10.0 - 0.5;
-        current = (current + change).max(1.0);
-        values.push(current);
-    }
-
-    values
-}
-
-fn series_bounds(values: &[f64]) -> (f64, f64) {
-    if values.is_empty() {
-        return (0.0, 1.0);
-    }
-
-    let mut min = f64::MAX;
-    let mut max = f64::MIN;
-    for value in values {
-        if *value < min {
-            min = *value;
-        }
-        if *value > max {
-            max = *value;
-        }
-    }
-
-    if (max - min).abs() < f64::EPSILON {
-        return (min - 1.0, max + 1.0);
-    }
-
-    let padding = (max - min) * 0.08;
-    (min - padding, max + padding)
 }
 
 fn handle_cli() -> Result<bool, Box<dyn Error>> {
@@ -3858,6 +4016,8 @@ fn handle_cli() -> Result<bool, Box<dyn Error>> {
                     name: "Imported".to_string(),
                     address: address.clone(),
                     has_key: true,
+                    key_origin: RAW_KEY_ORIGIN.to_string(),
+                    derivation_path: None,
                     added_at: Some(Utc::now().format("%Y-%m-%d").to_string()),
                 });
                 if config.active_wallet.is_none() {
@@ -3887,6 +4047,8 @@ fn handle_cli() -> Result<bool, Box<dyn Error>> {
                     name: name.clone(),
                     address: address.clone(),
                     has_key: true,
+                    key_origin: RAW_KEY_ORIGIN.to_string(),
+                    derivation_path: None,
                     added_at: Some(Utc::now().format("%Y-%m-%d").to_string()),
                 });
                 if config.active_wallet.is_none() {
@@ -3898,6 +4060,29 @@ fn handle_cli() -> Result<bool, Box<dyn Error>> {
                     name,
                     wallet_id,
                     short_address(&address)
+                );
+                return Ok(true);
+            }
+            "--generate-wallet" => {
+                let name = args.next().ok_or("Usage: den --generate-wallet <name>")?;
+                let address = create_random_wallet(&name)?;
+                println!(
+                    "Generated wallet '{}' ({}). Use the TUI Accounts tab and type REVEAL to back up the private key.",
+                    name,
+                    short_address(&address)
+                );
+                return Ok(true);
+            }
+            "--restore-mnemonic" => {
+                let name = args.next().ok_or("Usage: den --restore-mnemonic <name>")?;
+                let phrase =
+                    std::env::var("DEN_MNEMONIC").map_err(|_| "DEN_MNEMONIC is not set")?;
+                let address = restore_mnemonic_wallet(&name, &phrase)?;
+                println!(
+                    "Restored mnemonic wallet '{}' ({}) using {}.",
+                    name,
+                    short_address(&address),
+                    DEFAULT_DERIVATION_PATH
                 );
                 return Ok(true);
             }
@@ -3916,6 +4101,8 @@ fn handle_cli() -> Result<bool, Box<dyn Error>> {
                     name: name.clone(),
                     address: address.clone(),
                     has_key: false,
+                    key_origin: "watch".to_string(),
+                    derivation_path: None,
                     added_at: Some(Utc::now().format("%Y-%m-%d").to_string()),
                 });
                 if config.active_wallet.is_none() {
@@ -3966,6 +4153,7 @@ fn handle_cli() -> Result<bool, Box<dyn Error>> {
                 let removed = config.wallets.remove(idx);
                 if removed.has_key {
                     let _ = clear_secret_for_wallet(&removed.id);
+                    let _ = clear_mnemonic_for_wallet(&removed.id);
                 }
                 if config.active_wallet.as_deref() == Some(&removed.id) {
                     config.active_wallet = config.wallets.first().map(|w| w.id.clone());
@@ -4031,9 +4219,12 @@ fn handle_cli() -> Result<bool, Box<dyn Error>> {
                             Some(w) if w.has_key => {
                                 let name = w.name.clone();
                                 clear_secret_for_wallet(&id)?;
+                                let _ = clear_mnemonic_for_wallet(&id);
                                 if let Some(entry) = config.wallets.iter_mut().find(|e| e.id == id)
                                 {
                                     entry.has_key = false;
+                                    entry.key_origin = "watch".to_string();
+                                    entry.derivation_path = None;
                                 }
                                 save_den_config(&config)?;
                                 println!("Key removed for wallet '{}'. Now watch-only.", name);
@@ -4064,19 +4255,40 @@ fn handle_cli() -> Result<bool, Box<dyn Error>> {
                 println!("API key removed.");
                 return Ok(true);
             }
+            "--set-rpc-url" => {
+                let url = args.next().ok_or("Usage: den --set-rpc-url <URL>")?;
+                validate_rpc_url(&url)?;
+                ensure_config_exists();
+                let mut config = load_den_config();
+                config.network.custom_rpc_url = Some(url);
+                save_den_config(&config)?;
+                println!("Custom RPC URL saved. Use: den --set-network custom");
+                return Ok(true);
+            }
+            "--clear-rpc-url" => {
+                ensure_config_exists();
+                let mut config = load_den_config();
+                config.network.custom_rpc_url = None;
+                if config.network.default == "custom" {
+                    config.network.default = "mainnet".to_string();
+                }
+                save_den_config(&config)?;
+                println!("Custom RPC URL removed.");
+                return Ok(true);
+            }
             "--set-network" => {
                 let net = args
                     .next()
-                    .ok_or("Usage: den --set-network <mainnet|devnet>")?;
+                    .ok_or("Usage: den --set-network <mainnet|devnet|custom>")?;
                 match net.as_str() {
-                    "mainnet" | "devnet" => {
+                    "mainnet" | "devnet" | "custom" => {
                         ensure_config_exists();
                         let mut config = load_den_config();
                         config.network.default = net;
                         save_den_config(&config)?;
                         println!("Default network saved to config.");
                     }
-                    _ => return Err("Network must be 'mainnet' or 'devnet'".into()),
+                    _ => return Err("Network must be 'mainnet', 'devnet', or 'custom'".into()),
                 }
                 return Ok(true);
             }
@@ -4096,6 +4308,14 @@ fn handle_cli() -> Result<bool, Box<dyn Error>> {
                 println!("Den Wallet Status");
                 println!("  Config: {}", config_location_display());
                 println!("  Default network: {}", config.network.default);
+                println!(
+                    "  Custom RPC: {}",
+                    config
+                        .network
+                        .custom_rpc_url
+                        .as_deref()
+                        .unwrap_or("not set")
+                );
                 println!("  {}", api_key_status(&config));
                 println!("  Wallets: {}", config.wallets.len());
                 let active_name = active_wallet(&config)
@@ -4189,6 +4409,8 @@ fn handle_cli() -> Result<bool, Box<dyn Error>> {
                 println!();
                 println!("Wallet Management:");
                 println!("  --add-wallet NAME       Import key from DEN_SECRET_KEY with name");
+                println!("  --generate-wallet NAME  Generate a random keypair wallet");
+                println!("  --restore-mnemonic NAME Restore DEN_MNEMONIC at m/44'/501'/0'/0'");
                 println!("  --add-watch NAME ADDR   Add a watch-only wallet");
                 println!("  --list-wallets          List all wallets");
                 println!("  --switch-wallet NAME    Set active wallet by name or ID");
@@ -4200,12 +4422,16 @@ fn handle_cli() -> Result<bool, Box<dyn Error>> {
                 println!("Contacts:");
                 println!("  --list-contacts         List all contacts");
                 println!("  --export-contacts [FILE] Export contacts as JSON (stdout or file)");
-                println!("  --import-contacts FILE  Import contacts from JSON, skip duplicates");
+                println!(
+                    "  --import-contacts FILE  Import contacts from JSON, skip duplicates/invalid addresses"
+                );
                 println!();
                 println!("Configuration:");
                 println!("  --set-api-key KEY       Store Helius API key in config");
                 println!("  --clear-api-key         Remove API key");
-                println!("  --set-network NET       Set default network (mainnet|devnet)");
+                println!("  --set-network NET       Set default network (mainnet|devnet|custom)");
+                println!("  --set-rpc-url URL       Store custom RPC endpoint for custom network");
+                println!("  --clear-rpc-url         Remove custom RPC endpoint");
                 println!(
                     "  --migrate-config-to-bitwarden [--force]  Copy local config to Bitwarden"
                 );
@@ -4218,6 +4444,123 @@ fn handle_cli() -> Result<bool, Box<dyn Error>> {
     }
 
     Ok(false)
+}
+
+fn create_random_wallet(name: &str) -> Result<String, Box<dyn Error>> {
+    ensure_config_exists();
+    let keypair = Keypair::new();
+    let secret = keypair_to_base58_secret(&keypair);
+    let address = keypair.pubkey().to_string();
+    let mut config = load_den_config();
+    let wallet_id = next_wallet_id(&config);
+    store_secret_for_wallet(&wallet_id, &secret)?;
+    config.wallets.push(WalletEntry {
+        id: wallet_id.clone(),
+        name: name.to_string(),
+        address: address.clone(),
+        has_key: true,
+        key_origin: RAW_KEY_ORIGIN.to_string(),
+        derivation_path: None,
+        added_at: Some(Utc::now().format("%Y-%m-%d").to_string()),
+    });
+    if config.active_wallet.is_none() {
+        config.active_wallet = Some(wallet_id);
+    }
+    save_den_config(&config)?;
+    Ok(address)
+}
+
+fn prepare_mnemonic_wallet(name: &str) -> Result<PendingMnemonicWallet, Box<dyn Error>> {
+    let mnemonic = Mnemonic::generate_in(Language::English, 12)?;
+    let phrase = mnemonic.to_string();
+    let keypair = keypair_from_mnemonic_phrase(&phrase, 0)?;
+    Ok(PendingMnemonicWallet {
+        name: name.to_string(),
+        mnemonic: phrase,
+        secret: keypair_to_base58_secret(&keypair),
+        address: keypair.pubkey().to_string(),
+        derivation_path: DEFAULT_DERIVATION_PATH.to_string(),
+    })
+}
+
+fn restore_mnemonic_wallet(name: &str, phrase: &str) -> Result<String, Box<dyn Error>> {
+    let keypair = keypair_from_mnemonic_phrase(phrase, 0)?;
+    let pending = PendingMnemonicWallet {
+        name: name.to_string(),
+        mnemonic: normalize_mnemonic_phrase(phrase)?,
+        secret: keypair_to_base58_secret(&keypair),
+        address: keypair.pubkey().to_string(),
+        derivation_path: DEFAULT_DERIVATION_PATH.to_string(),
+    };
+    store_mnemonic_wallet(pending)
+}
+
+fn store_mnemonic_wallet(pending: PendingMnemonicWallet) -> Result<String, Box<dyn Error>> {
+    ensure_config_exists();
+    let mut config = load_den_config();
+    let wallet_id = next_wallet_id(&config);
+    store_secret_for_wallet(&wallet_id, &pending.secret)?;
+    store_mnemonic_for_wallet(&wallet_id, &pending.mnemonic)?;
+    config.wallets.push(WalletEntry {
+        id: wallet_id.clone(),
+        name: pending.name,
+        address: pending.address.clone(),
+        has_key: true,
+        key_origin: MNEMONIC_KEY_ORIGIN.to_string(),
+        derivation_path: Some(pending.derivation_path),
+        added_at: Some(Utc::now().format("%Y-%m-%d").to_string()),
+    });
+    if config.active_wallet.is_none() {
+        config.active_wallet = Some(wallet_id);
+    }
+    save_den_config(&config)?;
+    Ok(pending.address)
+}
+
+fn normalize_mnemonic_phrase(phrase: &str) -> Result<String, Box<dyn Error>> {
+    let mnemonic = Mnemonic::parse_in_normalized(Language::English, phrase)?;
+    Ok(mnemonic.to_string())
+}
+
+fn keypair_from_mnemonic_phrase(
+    phrase: &str,
+    account_index: u32,
+) -> Result<Keypair, Box<dyn Error>> {
+    let mnemonic = Mnemonic::parse_in_normalized(Language::English, phrase)?;
+    let seed = mnemonic.to_seed("");
+    let path = DerivationPath::new_bip44(Some(account_index), Some(0));
+    keypair_from_seed_and_derivation_path(seed.as_ref(), Some(path))
+}
+
+fn keypair_to_base58_secret(keypair: &Keypair) -> String {
+    bs58::encode(keypair.to_bytes()).into_string()
+}
+
+fn mnemonic_keychain_account(wallet_id: &str) -> String {
+    format!("{}:mnemonic", wallet_id)
+}
+
+fn store_mnemonic_for_wallet(wallet_id: &str, mnemonic: &str) -> Result<(), Box<dyn Error>> {
+    let account = mnemonic_keychain_account(wallet_id);
+    let entry = keyring::Entry::new(KEYCHAIN_SERVICE, &account)?;
+    entry.set_password(mnemonic)?;
+    Ok(())
+}
+
+fn load_mnemonic_for_wallet(wallet_id: &str) -> Result<String, Box<dyn Error>> {
+    let account = mnemonic_keychain_account(wallet_id);
+    let entry = keyring::Entry::new(KEYCHAIN_SERVICE, &account)?;
+    Ok(entry.get_password()?)
+}
+
+fn clear_mnemonic_for_wallet(wallet_id: &str) -> Result<(), Box<dyn Error>> {
+    let account = mnemonic_keychain_account(wallet_id);
+    let entry = keyring::Entry::new(KEYCHAIN_SERVICE, &account)?;
+    match entry.delete_password() {
+        Ok(_) => Ok(()),
+        Err(keyring::Error::NoEntry) => Ok(()),
+        Err(err) => Err(err.into()),
+    }
 }
 
 fn store_secret_for_wallet(wallet_id: &str, secret: &str) -> Result<(), Box<dyn Error>> {
@@ -4265,6 +4608,13 @@ fn clear_api_key() -> Result<(), Box<dyn Error>> {
 }
 
 fn api_key_status(config: &DenConfig) -> String {
+    if config.network.default == "custom" {
+        return if config.network.custom_rpc_url.is_some() {
+            "API Key: not required for custom RPC".to_string()
+        } else {
+            "API Key: custom RPC URL not set".to_string()
+        };
+    }
     if std::env::var("HELIUS_API_KEY").is_ok() {
         return "API Key: set (env)".to_string();
     }
@@ -4358,7 +4708,6 @@ fn broadcast_send(review: &SendReview, rpc_url: &str) -> Result<String, Box<dyn 
         symbol: review.asset_symbol.clone(),
         balance: String::new(),
         value: String::new(),
-        history: Vec::new(),
         mint: review.token_mint.clone(),
         decimals: review.token_decimals,
         token_program: review
@@ -4606,11 +4955,41 @@ fn resolve_api_key(config: &DenConfig) -> Option<String> {
         .or_else(|| config.network.api_key.clone())
 }
 
-fn build_rpc_url(api_key: &str, network: Network) -> String {
-    match network {
-        Network::Mainnet => format!("https://rpc.helius.xyz/?api-key={}", api_key),
-        Network::Devnet => format!("https://rpc-devnet.helius.xyz/?api-key={}", api_key),
+fn validate_rpc_url(url: &str) -> Result<(), Box<dyn Error>> {
+    let trimmed = url.trim();
+    if trimmed.starts_with("https://")
+        || trimmed.starts_with("http://localhost")
+        || trimmed.starts_with("http://127.0.0.1")
+    {
+        Ok(())
+    } else {
+        Err("custom RPC URL must be https:// or local http://localhost/127.0.0.1".into())
     }
+}
+
+fn rpc_url_for_network(config: &DenConfig, network: Network) -> Result<String, Box<dyn Error>> {
+    match network {
+        Network::Mainnet => {
+            let api_key = resolve_api_key(config).ok_or("API key not configured")?;
+            Ok(format!("https://rpc.helius.xyz/?api-key={}", api_key))
+        }
+        Network::Devnet => {
+            let api_key = resolve_api_key(config).ok_or("API key not configured")?;
+            Ok(format!(
+                "https://rpc-devnet.helius.xyz/?api-key={}",
+                api_key
+            ))
+        }
+        Network::Custom => config
+            .network
+            .custom_rpc_url
+            .clone()
+            .ok_or_else(|| "custom RPC URL not configured".into()),
+    }
+}
+
+fn network_supports_das(network: Network) -> bool {
+    !matches!(network, Network::Custom)
 }
 
 fn fetch_sol_balance(
@@ -4631,42 +5010,45 @@ fn build_refresh_snapshot(network: Network) -> Result<RefreshSnapshot, Box<dyn E
     let mut active_wallet_id = None;
     let mut total_balance = "0.00 SOL".to_string();
     let mut tokens = vec![placeholder_sol_token()];
+    let mut nfts = Vec::new();
     let mut history = vec![placeholder_transaction()];
 
-    let Some(api_key) = resolve_api_key(&den_config) else {
-        let accounts = den_config
-            .wallets
-            .iter()
-            .map(|w| Account {
-                id: w.id.clone(),
-                name: w.name.clone(),
-                address: w.address.clone(),
-                balance: "-.-- SOL".to_string(),
-                has_key: w.has_key,
-                is_active: den_config.active_wallet.as_deref() == Some(w.id.as_str()),
-                added_at: w.added_at.clone(),
-            })
-            .collect::<Vec<_>>();
+    let rpc_url = match rpc_url_for_network(&den_config, network) {
+        Ok(url) => url,
+        Err(err) => {
+            let accounts = den_config
+                .wallets
+                .iter()
+                .map(|w| Account {
+                    id: w.id.clone(),
+                    name: w.name.clone(),
+                    address: w.address.clone(),
+                    balance: "-.-- SOL".to_string(),
+                    has_key: w.has_key,
+                    is_active: den_config.active_wallet.as_deref() == Some(w.id.as_str()),
+                    added_at: w.added_at.clone(),
+                })
+                .collect::<Vec<_>>();
 
-        if let Some(active) = active_wallet(&den_config) {
-            wallet_address = short_address(&active.address);
-            active_wallet_id = Some(active.id.clone());
+            if let Some(active) = active_wallet(&den_config) {
+                wallet_address = short_address(&active.address);
+                active_wallet_id = Some(active.id.clone());
+            }
+
+            return Ok(RefreshSnapshot {
+                accounts,
+                active_wallet_id,
+                wallet_address,
+                total_balance,
+                tokens,
+                nfts: Vec::new(),
+                history,
+                keystore_status,
+                api_key_status,
+                status: format!("Network unavailable: {}", err),
+            });
         }
-
-        return Ok(RefreshSnapshot {
-            accounts,
-            active_wallet_id,
-            wallet_address,
-            total_balance,
-            tokens,
-            history,
-            keystore_status,
-            api_key_status,
-            status: "No API key. Run: den --set-api-key <key>".to_string(),
-        });
     };
-
-    let rpc_url = build_rpc_url(&api_key, network);
     let client = reqwest::blocking::Client::new();
 
     let mut accounts = Vec::new();
@@ -4691,6 +5073,7 @@ fn build_refresh_snapshot(network: Network) -> Result<RefreshSnapshot, Box<dyn E
         let config = Config {
             address: active.address.clone(),
             rpc_url,
+            supports_das: network_supports_das(network),
         };
         active_wallet_id = Some(active.id.clone());
         wallet_address = short_address(&active.address);
@@ -4702,6 +5085,7 @@ fn build_refresh_snapshot(network: Network) -> Result<RefreshSnapshot, Box<dyn E
                     acc.balance = total_balance.clone();
                 }
                 tokens = data.tokens;
+                nfts = data.nfts;
                 history = if data.history.is_empty() {
                     vec![placeholder_transaction()]
                 } else {
@@ -4723,6 +5107,7 @@ fn build_refresh_snapshot(network: Network) -> Result<RefreshSnapshot, Box<dyn E
         wallet_address,
         total_balance,
         tokens,
+        nfts,
         history,
         keystore_status,
         api_key_status,
@@ -4732,14 +5117,30 @@ fn build_refresh_snapshot(network: Network) -> Result<RefreshSnapshot, Box<dyn E
 
 fn fetch_wallet_data(config: &Config) -> Result<WalletData, Box<dyn Error>> {
     let client = reqwest::blocking::Client::new();
-
-    let das_result = das_get_assets(&client, &config.rpc_url, &config.address)?;
-
     let history = rpc_get_history(&client, &config.rpc_url, &config.address)?;
 
+    if config.supports_das {
+        let das_result = das_get_assets(&client, &config.rpc_url, &config.address)?;
+        return Ok(WalletData {
+            sol_balance: das_result.sol_balance,
+            tokens: das_result.tokens,
+            nfts: das_result.nfts,
+            history,
+        });
+    }
+
+    let sol_balance = fetch_sol_balance(&client, &config.rpc_url, &config.address)?;
     Ok(WalletData {
-        sol_balance: das_result.sol_balance,
-        tokens: das_result.tokens,
+        sol_balance,
+        tokens: vec![Token {
+            symbol: "SOL".to_string(),
+            balance: format!("{:.4}", sol_balance),
+            value: "-".to_string(),
+            mint: None,
+            decimals: 9,
+            token_program: None,
+        }],
+        nfts: Vec::new(),
         history,
     })
 }
@@ -4747,6 +5148,7 @@ fn fetch_wallet_data(config: &Config) -> Result<WalletData, Box<dyn Error>> {
 struct DasResult {
     sol_balance: f64,
     tokens: Vec<Token>,
+    nfts: Vec<Nft>,
 }
 
 fn das_get_assets(
@@ -4788,19 +5190,45 @@ fn das_get_assets(
         symbol: "SOL".to_string(),
         balance: format!("{:.4}", sol_balance),
         value: sol_value,
-        history: Vec::new(),
         mint: None,
         decimals: 9,
         token_program: None,
     }];
 
-    // Fungible tokens from DAS
+    let mut nfts = Vec::new();
+
+    // Fungible tokens and NFTs from DAS
     if let Some(items) = result.get("items").and_then(|i| i.as_array()) {
         for item in items {
             let interface = item.get("interface").and_then(|i| i.as_str()).unwrap_or("");
 
-            // Skip non-fungible assets
             if interface != "FungibleToken" && interface != "FungibleAsset" {
+                if let Some(id) = item.get("id").and_then(|id| id.as_str()) {
+                    let name = item
+                        .get("content")
+                        .and_then(|c| c.get("metadata"))
+                        .and_then(|m| m.get("name"))
+                        .and_then(|s| s.as_str())
+                        .unwrap_or("Unnamed NFT")
+                        .to_string();
+                    let collection = item
+                        .get("grouping")
+                        .and_then(|g| g.as_array())
+                        .and_then(|groups| {
+                            groups.iter().find_map(|group| {
+                                let label = group.get("group_key").and_then(|v| v.as_str());
+                                let value = group.get("group_value").and_then(|v| v.as_str());
+                                (label == Some("collection")).then_some(value).flatten()
+                            })
+                        })
+                        .unwrap_or("-")
+                        .to_string();
+                    nfts.push(Nft {
+                        name,
+                        collection,
+                        address: id.to_string(),
+                    });
+                }
                 continue;
             }
 
@@ -4843,7 +5271,6 @@ fn das_get_assets(
                 symbol: display_symbol.clone(),
                 balance: format_token_balance(ui_balance, decimals),
                 value,
-                history: Vec::new(),
                 mint: item
                     .get("id")
                     .and_then(|id| id.as_str())
@@ -4860,7 +5287,19 @@ fn das_get_assets(
     Ok(DasResult {
         sol_balance,
         tokens,
+        nfts,
     })
+}
+
+fn token_program_label(token: &Token) -> String {
+    match (&token.mint, token.token_program.as_deref()) {
+        (None, _) => "native SOL".to_string(),
+        (Some(_), Some(program)) if program == spl_token::id().to_string() => {
+            "SPL Token".to_string()
+        }
+        (Some(_), Some(program)) => format!("unsupported/Token2022? {}", short_address(program)),
+        (Some(_), None) => "unknown token program".to_string(),
+    }
 }
 
 fn format_token_balance(balance: f64, decimals: u64) -> String {

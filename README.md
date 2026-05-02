@@ -24,7 +24,7 @@ den
 ## Features
 - Multi-tab wallet overview (accounts, tokens, history, address book, settings)
 - Live balance + token fetch from Helius RPC with non-blocking TUI refreshes
-- Keychain-backed key import (macOS)
+- Keychain-backed key import, generation, and 12-word seed wallet restore (macOS)
 - Message signing from stored key
 - Receive-address QR display and clipboard copy shortcuts
 
@@ -69,7 +69,7 @@ Wallet secrets are stored in macOS Keychain. Config can be local or centralized 
 
 | Storage | Location | Contents |
 |---------|----------|----------|
-| Keychain | `den-wallet` service | Wallet private keys |
+| Keychain | `den-wallet` service | Wallet private keys and seed phrases for mnemonic-created/restored wallets |
 | Config file | `~/.config/den/config.toml` (or `~/Library/Application Support/den/config.toml` on macOS) | Local config backend |
 | Bitwarden item | `DEN_BW_CONFIG_ITEM_ID` | Centralized config backend |
 | Env vars | Shell environment | `HELIUS_API_KEY`, `DEN_CONFIG_BACKEND`, `DEN_BW_CONFIG_ITEM_ID` |
@@ -85,6 +85,8 @@ Wallet secrets are stored in macOS Keychain. Config can be local or centralized 
 ```
 Wallet Management:
 --add-wallet NAME       Import key from DEN_SECRET_KEY with name
+--generate-wallet NAME  Generate a random keypair wallet
+--restore-mnemonic NAME Restore DEN_MNEMONIC at m/44'/501'/0'/0'
 --add-watch NAME ADDR   Add a watch-only wallet
 --list-wallets          List all wallets
 --switch-wallet NAME    Set active wallet by name or ID
@@ -101,7 +103,9 @@ Contacts:
 Configuration:
 --set-api-key KEY       Store Helius API key in config
 --clear-api-key         Remove API key
---set-network NET       Set default network (mainnet|devnet)
+--set-network NET       Set default network (mainnet|devnet|custom)
+--set-rpc-url URL       Store custom RPC endpoint
+--clear-rpc-url         Remove custom RPC endpoint
 --migrate-config-to-bitwarden [--force]  Copy local config to Bitwarden
 --config-path           Show active config location
 --status                Show full status
@@ -118,11 +122,11 @@ Configuration:
 | Secure key storage (macOS Keychain) | Done | Via `keyring` crate |
 | Delete stored key | Done | `--clear` CLI flag |
 | Derive address from stored key | Done | Falls back when `WALLET_ADDRESS` unset |
-| Generate new keypair | Not started | |
-| Mnemonic / seed phrase (BIP39) | Not started | |
-| HD derivation (BIP44 m/44'/501') | Not started | |
+| Generate new keypair | Done | TUI `g` on Accounts or `--generate-wallet` CLI |
+| Mnemonic / seed phrase (BIP39) | Done | TUI `m` creates a 12-word English phrase; `p` restores; CLI restore reads `DEN_MNEMONIC` |
+| HD derivation (BIP44 m/44'/501') | Done | Uses `m/44'/501'/0'/0'` initially |
 | Multiple accounts / wallets | Done | Full and watch-only wallets supported |
-| Export / backup key | Not started | |
+| Export / backup key | Done | TUI `x` requires typing `REVEAL`; copies private key or seed phrase only after reveal |
 | Password / PIN protection | Not started | |
 | Session auto-lock | Not started | |
 | Hardware wallet (Ledger) | Not started | |
@@ -137,9 +141,9 @@ Configuration:
 | Token metadata resolution | Done | Symbols and names from DAS metadata |
 | Token prices (USD) | Done | Via DAS `price_info.price_per_token` |
 | Portfolio value (USD) | Done | SOL + token values displayed |
-| Token2022 support | Not started | DAS may already return these; untested |
-| NFT display | Not started | |
-| Real-time price charts | Not started | Chart uses seeded fake data |
+| Token2022 support | Partial | Non-SPL Token programs are marked unsupported/unknown; sends remain blocked |
+| NFT display | Done | DAS NFT count/list appears in asset details |
+| Real-time price charts | Not started | Fake seeded chart data was removed; charts show unavailable until real history exists |
 
 ### Transactions
 
@@ -169,7 +173,7 @@ Configuration:
 | Mainnet | Done | Via Helius RPC |
 | Devnet | Done | Via Helius devnet RPC |
 | Network toggle | Done | `n` keybinding |
-| Custom RPC endpoint | Not started | Hardcoded to Helius |
+| Custom RPC endpoint | Done | Custom network uses standard RPC for SOL balance/history/sends; Helius DAS metadata is unavailable there |
 
 ### Address Book
 

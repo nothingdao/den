@@ -31,3 +31,6 @@ base64 = "0.22"
 bincode = "1"
 spl-associated-token-account = "7"
 spl-token = "8"
+bip39 = { version = "2", features = ["rand"] }
+solana-keypair = { version = "2.2.3", features = ["seed-derivable"] }
+solana-derivation-path = "2.2.1"

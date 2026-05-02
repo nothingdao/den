@@ -38,6 +38,7 @@ Colors are loaded from `~/.config/den/theme.toml` at startup via `init_den_theme
 
 ```text
 src/main.rs                           — main application
+src/theme.rs                          — Den theme loading/hot-reload helpers
 Cargo.toml                            — package/binary metadata
 .github/workflows/release.yml         — release automation
 packaging/homebrew/den.rb.template    — Homebrew formula template
@@ -55,7 +56,7 @@ docs/architecture/overview.md         — architecture notes
 
 ## Important Behaviors
 
-- `src/main.rs` is still the primary implementation file.
+- `src/main.rs` is still the primary implementation file, with theme helpers split into `src/theme.rs`.
 - Network fetches are blocking, so refreshes can freeze the UI briefly.
 - `--set-api-key` stores the API key in config, not Keychain.
 - Contacts are persisted now; they are no longer placeholder-only.
