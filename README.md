@@ -40,7 +40,7 @@ den
 
 ## Setup
 
-Store your Helius API key (required for live data):
+Store your Helius API key (required for live data and send simulation/broadcast):
 ```bash
 den --set-api-key YOUR_HELIUS_KEY
 ```
@@ -56,6 +56,10 @@ Check current status:
 ```bash
 den --status
 ```
+
+### Sending
+
+Open the Send tab, choose an asset with Up/Down, press Enter, then enter the recipient and amount. Den simulates the transaction first; failures block the send. If simulation passes, review the transaction details, press Enter, and type `SEND` to sign and broadcast. Watch-only wallets cannot send. SPL sends are limited to the classic SPL Token program for now; Token2022 sends are blocked until support is validated.
 
 If you have not installed the binary yet, prefix the same commands with `cargo run --`.
 
@@ -142,11 +146,11 @@ Configuration:
 | Feature | Status | Notes |
 |---------|--------|-------|
 | Transaction history list | Done | Via `getSignaturesForAddress`, last 10 |
-| Send SOL | Not started | Send tab is a static mockup |
-| Send SPL tokens | Not started | |
-| Transaction detail view | Not started | Shows signature + slot only |
-| Transaction confirmation / review | Not started | |
-| Transaction simulation | Not started | |
+| Send SOL | Done | Send tab requires simulation, review, and typed confirmation before broadcast |
+| Send SPL tokens | Done | SPL Token only; creates recipient ATA when missing; Token2022 sends are blocked pending validation |
+| Transaction detail view | Done | Shows status, slot, summary, amount, and signature |
+| Transaction confirmation / review | Done | Review screen is required before signing/broadcast |
+| Transaction simulation | Done | Simulation failures block sending |
 | Priority fees | Not started | |
 | Versioned transactions (v0) | Not started | |
 | Devnet airdrop | Not started | |
@@ -156,7 +160,7 @@ Configuration:
 | Feature | Status | Notes |
 |---------|--------|-------|
 | Sign arbitrary message | Done | From stored Keychain key |
-| Sign transaction | Not started | No send flow yet |
+| Sign transaction | Done | Reviewed send flow signs only after typed confirmation |
 
 ### Network
 

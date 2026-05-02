@@ -4,10 +4,12 @@ use std::fs;
 use std::io::{self, Write};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
+use std::str::FromStr;
 use std::sync::{Mutex, OnceLock, mpsc};
 use std::thread;
 use std::time::{Duration, SystemTime};
 
+use base64::{Engine as _, engine::general_purpose};
 use chrono::Utc;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use crossterm::execute;
@@ -25,8 +27,14 @@ use ratatui::widgets::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use solana_sdk::hash::Hash;
+use solana_sdk::instruction::Instruction;
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::{Keypair, Signer};
+use solana_sdk::system_instruction;
+use solana_sdk::transaction::Transaction as SolanaTransaction;
+use spl_associated_token_account::get_associated_token_address;
+use spl_associated_token_account::instruction::create_associated_token_account_idempotent;
 
 const KEYCHAIN_SERVICE: &str = "den-wallet";
 const KEYCHAIN_API_KEY_ACCOUNT: &str = "helius-api-key";
@@ -270,6 +278,9 @@ struct Token {
     balance: String,
     value: String,
     history: Vec<f64>,
+    mint: Option<String>,
+    decimals: u8,
+    token_program: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -288,6 +299,9 @@ struct Transaction {
     time: String,
     summary: String,
     amount: String,
+    signature: String,
+    slot: u64,
+    failed: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -306,6 +320,23 @@ struct ContactsFile {
     version: u32,
     #[serde(default)]
     contacts: Vec<Contact>,
+}
+
+#[derive(Clone, Debug)]
+struct SendReview {
+    from_wallet_id: String,
+    from_name: String,
+    from_address: String,
+    to_address: String,
+    asset_symbol: String,
+    amount_display: String,
+    raw_amount: u64,
+    token_mint: Option<String>,
+    token_decimals: u8,
+    creates_recipient_ata: bool,
+    fee_estimate: String,
+    simulation_units: Option<u64>,
+    network: Network,
 }
 
 fn default_contact_network() -> String {
@@ -1069,6 +1100,9 @@ enum InputMode {
     EditContactAddress,
     EditContactNotes,
     ConfirmDeleteContact,
+    SendRecipient,
+    SendAmount,
+    ConfirmSend,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1133,7 +1167,10 @@ struct App {
     import_state: ImportState,
     wallet_detail_index: Option<usize>,
     contact_detail_index: Option<usize>,
+    history_detail_index: Option<usize>,
     last_signature: String,
+    send_recipient: String,
+    pending_send: Option<SendReview>,
     refresh_tx: mpsc::Sender<RefreshMessage>,
     refresh_rx: mpsc::Receiver<RefreshMessage>,
     refresh_in_flight: bool,
@@ -1149,17 +1186,8 @@ impl App {
             should_quit: false,
             tab: Tab::Overview,
             accounts: Vec::new(),
-            tokens: vec![Token {
-                symbol: "SOL".to_string(),
-                balance: "0.00".to_string(),
-                value: "-".to_string(),
-                history: seeded_series("SOL", 16),
-            }],
-            history: vec![Transaction {
-                time: "".to_string(),
-                summary: "No transactions".to_string(),
-                amount: "".to_string(),
-            }],
+            tokens: vec![placeholder_sol_token()],
+            history: vec![placeholder_transaction()],
             contacts: Vec::new(),
             selected_account: 0,
             selected_token: 0,
@@ -1182,7 +1210,10 @@ impl App {
             },
             wallet_detail_index: None,
             contact_detail_index: None,
+            history_detail_index: None,
             last_signature: "-".to_string(),
+            send_recipient: String::new(),
+            pending_send: None,
             refresh_tx,
             refresh_rx,
             refresh_in_flight: false,
@@ -1202,11 +1233,7 @@ impl App {
         self.total_balance = format!("{:.4} SOL", data.sol_balance);
         self.tokens = data.tokens;
         self.history = if data.history.is_empty() {
-            vec![Transaction {
-                time: "".to_string(),
-                summary: "No transactions".to_string(),
-                amount: "".to_string(),
-            }]
+            vec![placeholder_transaction()]
         } else {
             data.history
         };
@@ -1292,6 +1319,16 @@ impl App {
                 self.contacts
                     .get(idx)
                     .map(|contact| ("contact address", contact.address.clone()))
+            }
+            Tab::History => {
+                let idx = self.history_detail_index.unwrap_or(self.selected_history);
+                self.history.get(idx).and_then(|tx| {
+                    if tx.signature.is_empty() {
+                        None
+                    } else {
+                        Some(("transaction signature", tx.signature.clone()))
+                    }
+                })
             }
             _ => None,
         };
@@ -1407,6 +1444,18 @@ impl App {
                     } else {
                         self.wallet_detail_index = Some(self.selected_account);
                     }
+                } else if self.tab == Tab::Send {
+                    if self.pending_send.is_some() {
+                        self.input_mode = InputMode::ConfirmSend;
+                        self.input_buffer.clear();
+                    } else {
+                        self.start_send_flow();
+                    }
+                } else if self.tab == Tab::History
+                    && self.history_detail_index.is_none()
+                    && !self.history.is_empty()
+                {
+                    self.history_detail_index = Some(self.selected_history);
                 } else if self.tab == Tab::AddressBook
                     && self.contact_detail_index.is_none()
                     && !self.contacts.is_empty()
@@ -1419,6 +1468,11 @@ impl App {
                     self.wallet_detail_index = None;
                 } else if self.tab == Tab::AddressBook && self.contact_detail_index.is_some() {
                     self.contact_detail_index = None;
+                } else if self.tab == Tab::History && self.history_detail_index.is_some() {
+                    self.history_detail_index = None;
+                } else if self.tab == Tab::Send && self.pending_send.is_some() {
+                    self.pending_send = None;
+                    self.status = "Send cancelled".to_string();
                 }
             }
             KeyCode::Char('c') => {
@@ -1452,6 +1506,96 @@ impl App {
                 }
             }
             _ => {}
+        }
+    }
+
+    fn selected_send_token(&self) -> Token {
+        self.tokens
+            .get(self.selected_token)
+            .cloned()
+            .or_else(|| self.tokens.first().cloned())
+            .unwrap_or_else(placeholder_sol_token)
+    }
+
+    fn start_send_flow(&mut self) {
+        let config = load_den_config();
+        match active_wallet(&config) {
+            Some(wallet) if !wallet.has_key => {
+                self.status = format!("Cannot send: '{}' is watch-only", wallet.name);
+            }
+            Some(_) => {
+                self.pending_send = None;
+                self.send_recipient.clear();
+                self.input_mode = InputMode::SendRecipient;
+                self.input_buffer.clear();
+            }
+            None => {
+                self.status = "No active wallet".to_string();
+            }
+        }
+    }
+
+    fn prepare_send_review(&mut self, amount: &str) {
+        let config = load_den_config();
+        let Some(wallet) = active_wallet(&config).cloned() else {
+            self.status = "No active wallet".to_string();
+            return;
+        };
+        if !wallet.has_key {
+            self.status = format!("Cannot send: '{}' is watch-only", wallet.name);
+            return;
+        }
+        let Some(api_key) = resolve_api_key(&config) else {
+            self.status = "Cannot send: API key not configured".to_string();
+            return;
+        };
+        let token = self.selected_send_token();
+        let rpc_url = build_rpc_url(&api_key, self.network);
+        match build_send_review(
+            &wallet,
+            &token,
+            &self.send_recipient,
+            amount,
+            &rpc_url,
+            self.network,
+        ) {
+            Ok(review) => {
+                self.pending_send = Some(review);
+                self.status =
+                    "Simulation passed. Review details, then press Enter to confirm.".to_string();
+            }
+            Err(err) => {
+                self.pending_send = None;
+                self.status = format!("Send blocked: {}", err);
+            }
+        }
+    }
+
+    fn confirm_pending_send(&mut self, input: &str) {
+        if input != "SEND" {
+            self.status = "Send cancelled".to_string();
+            return;
+        }
+        let Some(review) = self.pending_send.clone() else {
+            self.status = "No pending send".to_string();
+            return;
+        };
+        let config = load_den_config();
+        let Some(api_key) = resolve_api_key(&config) else {
+            self.status = "Send failed: API key not configured".to_string();
+            return;
+        };
+        let rpc_url = build_rpc_url(&api_key, review.network);
+        match broadcast_send(&review, &rpc_url) {
+            Ok(signature) => {
+                self.last_signature = signature.clone();
+                self.pending_send = None;
+                self.status = format!("Transaction sent: {}", short_address(&signature));
+                self.start_refresh();
+            }
+            Err(err) => {
+                self.status = format!("Send failed: {}", err);
+            }
         }
     }
 
@@ -1933,6 +2077,29 @@ impl App {
                             self.status = "Delete cancelled".to_string();
                         }
                     }
+                    InputMode::SendRecipient => {
+                        if input.is_empty() {
+                            self.status = "Send cancelled".to_string();
+                        } else if let Err(err) = validate_solana_address(&input) {
+                            self.status = err;
+                            return;
+                        } else {
+                            self.send_recipient = input;
+                            self.input_mode = InputMode::SendAmount;
+                            self.input_buffer.clear();
+                            return;
+                        }
+                    }
+                    InputMode::SendAmount => {
+                        if input.is_empty() {
+                            self.status = "Send cancelled".to_string();
+                        } else {
+                            self.prepare_send_review(&input);
+                        }
+                    }
+                    InputMode::ConfirmSend => {
+                        self.confirm_pending_send(&input);
+                    }
                     InputMode::None => {}
                 }
                 self.input_mode = InputMode::None;
@@ -1949,7 +2116,10 @@ impl App {
     }
 
     fn move_selection(&mut self, delta: isize) {
-        if self.wallet_detail_index.is_some() || self.contact_detail_index.is_some() {
+        if self.wallet_detail_index.is_some()
+            || self.contact_detail_index.is_some()
+            || self.history_detail_index.is_some()
+        {
             return;
         }
         let clamp = |value: isize, max: usize| -> usize {
@@ -1965,7 +2135,7 @@ impl App {
                 let next = self.selected_account as isize + delta;
                 self.selected_account = clamp(next, self.accounts.len());
             }
-            Tab::Tokens => {
+            Tab::Tokens | Tab::Send => {
                 let next = self.selected_token as isize + delta;
                 self.selected_token = clamp(next, self.tokens.len());
             }
@@ -2094,7 +2264,10 @@ fn ui(frame: &mut ratatui::prelude::Frame, app: &App) {
             &app.status,
             footer_height,
             app.tab,
-            app.wallet_detail_index.is_some() || app.contact_detail_index.is_some(),
+            app.wallet_detail_index.is_some()
+                || app.contact_detail_index.is_some()
+                || app.history_detail_index.is_some()
+                || app.pending_send.is_some(),
         );
     }
 
@@ -2574,7 +2747,11 @@ fn render_token_chart(frame: &mut ratatui::prelude::Frame, area: Rect, app: &App
 }
 
 fn render_history(frame: &mut ratatui::prelude::Frame, area: Rect, app: &App) {
-    render_history_list(frame, area, app);
+    if let Some(index) = app.history_detail_index {
+        render_transaction_detail(frame, area, app, index);
+    } else {
+        render_history_list(frame, area, app);
+    }
 }
 
 fn render_history_list(frame: &mut ratatui::prelude::Frame, area: Rect, app: &App) {
@@ -2606,6 +2783,81 @@ fn render_history_list(frame: &mut ratatui::prelude::Frame, area: Rect, app: &Ap
         .style(Style::default().fg(theme().fg));
 
     frame.render_stateful_widget(list, area, &mut list_state(app.selected_history));
+}
+
+fn render_transaction_detail(
+    frame: &mut ratatui::prelude::Frame,
+    area: Rect,
+    app: &App,
+    index: usize,
+) {
+    let tx = match app.history.get(index) {
+        Some(tx) => tx,
+        None => {
+            let msg = Paragraph::new("Transaction not found")
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_style(Style::default().fg(theme().border))
+                        .title("Transaction Detail"),
+                )
+                .style(Style::default().fg(theme().accent));
+            frame.render_widget(msg, area);
+            return;
+        }
+    };
+
+    let status = if tx.failed { "Failed" } else { "Confirmed" };
+    let signature = if tx.signature.is_empty() {
+        "Unavailable"
+    } else {
+        &tx.signature
+    };
+    let info = Text::from(vec![
+        Line::from(vec![
+            Span::styled("  Status:    ", Style::default().fg(theme().fg_dim)),
+            Span::styled(
+                status,
+                Style::default().fg(if tx.failed {
+                    theme().red
+                } else {
+                    theme().green
+                }),
+            ),
+        ]),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("  Slot:      ", Style::default().fg(theme().fg_dim)),
+            Span::styled(tx.slot.to_string(), Style::default().fg(theme().fg)),
+        ]),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("  Summary:   ", Style::default().fg(theme().fg_dim)),
+            Span::styled(&tx.summary, Style::default().fg(theme().fg)),
+        ]),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("  Amount:    ", Style::default().fg(theme().fg_dim)),
+            Span::styled(&tx.amount, Style::default().fg(theme().fg)),
+        ]),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("  Signature: ", Style::default().fg(theme().fg_dim)),
+            Span::styled(signature, Style::default().fg(theme().fg)),
+        ]),
+        Line::from(""),
+        Line::from("  Press c to copy signature, Esc to return."),
+    ]);
+
+    let paragraph = Paragraph::new(info)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(theme().border))
+                .title("Transaction Detail"),
+        )
+        .style(Style::default().fg(theme().fg));
+    frame.render_widget(paragraph, area);
 }
 
 fn render_address_book(frame: &mut ratatui::prelude::Frame, area: Rect, app: &App) {
@@ -2770,6 +3022,11 @@ fn render_contact_detail(frame: &mut ratatui::prelude::Frame, area: Rect, app: &
 }
 
 fn render_send(frame: &mut ratatui::prelude::Frame, area: Rect, app: &App) {
+    if let Some(review) = &app.pending_send {
+        render_send_review(frame, area, review);
+        return;
+    }
+
     if let Some(acc) = app.accounts.iter().find(|a| a.is_active) {
         if !acc.has_key {
             let notice = Paragraph::new(
@@ -2789,38 +3046,52 @@ fn render_send(frame: &mut ratatui::prelude::Frame, area: Rect, app: &App) {
     }
 
     let (account_name, account_address) = active_account(app);
+    let token = app.selected_send_token();
+    let asset_hint = if token.mint.is_some() {
+        format!(
+            "{} ({})",
+            token.symbol,
+            short_address(token.mint.as_deref().unwrap_or(""))
+        )
+    } else {
+        "SOL".to_string()
+    };
 
     let layout = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(7),
+            Constraint::Length(8),
             Constraint::Length(7),
             Constraint::Min(0),
         ])
         .split(area);
 
     let fields = Text::from(vec![
-        Line::from(format!("From: {} ({})", account_name, account_address)),
-        Line::from("To:    [paste address or pick contact]"),
-        Line::from("Asset: SOL"),
-        Line::from("Amount: 0.00"),
+        Line::from(format!("From:   {} ({})", account_name, account_address)),
+        Line::from("To:     Enter recipient when prompted"),
+        Line::from(format!("Asset:  {}", asset_hint)),
+        Line::from(format!("Balance: {}", token.balance)),
+        Line::from("Amount: Enter amount when prompted"),
     ]);
 
     let details = Text::from(vec![
-        Line::from("Network: Solana mainnet"),
-        Line::from("Fee: 0.000005 SOL"),
-        Line::from("Max: 0.00 SOL"),
+        Line::from(format!("Network: {}", app.network.label())),
+        Line::from("Fee: default Solana fee; priority fees deferred"),
+        Line::from("Simulation: required; failures block sending"),
+        Line::from("SPL Token: recipient ATA is created when missing"),
     ]);
 
-    let actions = Paragraph::new("[Enter] Review & Send   [Esc] Cancel")
-        .alignment(Alignment::Center)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(theme().border))
-                .title("Actions"),
-        )
-        .style(Style::default().fg(theme().fg));
+    let actions = Paragraph::new(
+        "Up/Down: choose asset   Enter: enter recipient/amount   Esc: cancel review",
+    )
+    .alignment(Alignment::Center)
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(theme().border))
+            .title("Actions"),
+    )
+    .style(Style::default().fg(theme().fg));
 
     frame.render_widget(
         Paragraph::new(fields)
@@ -2845,6 +3116,85 @@ fn render_send(frame: &mut ratatui::prelude::Frame, area: Rect, app: &App) {
         layout[1],
     );
     frame.render_widget(actions, layout[2]);
+}
+
+fn render_send_review(frame: &mut ratatui::prelude::Frame, area: Rect, review: &SendReview) {
+    let ata_line = if review.token_mint.is_some() {
+        if review.creates_recipient_ata {
+            "Recipient token account: will be created"
+        } else {
+            "Recipient token account: already exists"
+        }
+    } else {
+        "Recipient token account: not needed for SOL"
+    };
+    let simulation = review
+        .simulation_units
+        .map(|units| format!("passed ({} compute units)", units))
+        .unwrap_or_else(|| "passed".to_string());
+    let mint = review
+        .token_mint
+        .as_deref()
+        .map(short_address)
+        .unwrap_or_else(|| "native SOL".to_string());
+    let content = Text::from(vec![
+        Line::from(vec![
+            Span::styled("  From:      ", Style::default().fg(theme().fg_dim)),
+            Span::styled(
+                format!(
+                    "{} ({})",
+                    review.from_name,
+                    short_address(&review.from_address)
+                ),
+                Style::default().fg(theme().fg),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("  To:        ", Style::default().fg(theme().fg_dim)),
+            Span::styled(&review.to_address, Style::default().fg(theme().fg)),
+        ]),
+        Line::from(vec![
+            Span::styled("  Asset:     ", Style::default().fg(theme().fg_dim)),
+            Span::styled(
+                format!("{} ({})", review.asset_symbol, mint),
+                Style::default().fg(theme().fg),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("  Amount:    ", Style::default().fg(theme().fg_dim)),
+            Span::styled(&review.amount_display, Style::default().fg(theme().fg)),
+        ]),
+        Line::from(vec![
+            Span::styled("  Network:   ", Style::default().fg(theme().fg_dim)),
+            Span::styled(review.network.label(), Style::default().fg(theme().fg)),
+        ]),
+        Line::from(vec![
+            Span::styled("  Fee:       ", Style::default().fg(theme().fg_dim)),
+            Span::styled(&review.fee_estimate, Style::default().fg(theme().fg)),
+        ]),
+        Line::from(vec![
+            Span::styled("  Simulation:", Style::default().fg(theme().fg_dim)),
+            Span::styled(
+                format!(" {}", simulation),
+                Style::default().fg(theme().green),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("  SPL ATA:   ", Style::default().fg(theme().fg_dim)),
+            Span::styled(ata_line, Style::default().fg(theme().fg)),
+        ]),
+        Line::from(""),
+        Line::from("  Press Enter, then type SEND to sign and broadcast. Esc cancels."),
+    ]);
+    let paragraph = Paragraph::new(content)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(theme().border))
+                .title("Review Transaction"),
+        )
+        .style(Style::default().fg(theme().fg));
+    frame.render_widget(paragraph, area);
 }
 
 fn render_receive(frame: &mut ratatui::prelude::Frame, area: Rect, app: &App) {
@@ -3061,7 +3411,11 @@ fn footer_nav_text(tab: Tab, in_detail: bool) -> &'static str {
         Tab::Accounts => {
             "Enter:details | c:copy | a:add | w:watch | e:rename | d:delete | r:refresh | q:quit"
         }
+        Tab::Send if in_detail => "Review: Enter then type SEND to broadcast | Esc:cancel | q:quit",
+        Tab::Send => "up/down:asset | Enter:send flow | q:quit",
         Tab::Receive => "c:copy address | QR shown | q:quit",
+        Tab::History if in_detail => "c:copy signature | Esc:back | q:quit",
+        Tab::History => "Enter:details | c:copy signature | up/down | q:quit",
         Tab::AddressBook if in_detail => {
             "c:copy | e:name | a:address | o:notes | d:delete | Esc:back"
         }
@@ -3353,6 +3707,21 @@ fn render_input_modal(frame: &mut ratatui::prelude::Frame, app: &App) {
             contact_delete_prompt,
             app.input_buffer.clone(),
         ),
+        InputMode::SendRecipient => (
+            "Send",
+            "Enter recipient wallet address:".to_string(),
+            app.input_buffer.clone(),
+        ),
+        InputMode::SendAmount => (
+            "Send",
+            format!("Enter amount of {}:", app.selected_send_token().symbol),
+            app.input_buffer.clone(),
+        ),
+        InputMode::ConfirmSend => (
+            "Confirm Send",
+            "Type SEND to sign and broadcast:".to_string(),
+            app.input_buffer.clone(),
+        ),
         InputMode::None => ("", String::new(), String::new()),
     };
 
@@ -3391,6 +3760,8 @@ fn status_style(message: &str) -> Style {
         || lower.contains("removed")
         || lower.contains("updated")
         || lower.contains("deleted")
+        || lower.contains("sent")
+        || lower.contains("simulation passed")
     {
         Style::default().fg(theme().green)
     } else {
@@ -3401,6 +3772,29 @@ fn status_style(message: &str) -> Style {
 fn render_background(frame: &mut ratatui::prelude::Frame, area: Rect) {
     let background = Block::default().style(Style::default().bg(theme().bg));
     frame.render_widget(background, area);
+}
+
+fn placeholder_sol_token() -> Token {
+    Token {
+        symbol: "SOL".to_string(),
+        balance: "0.00".to_string(),
+        value: "-".to_string(),
+        history: Vec::new(),
+        mint: None,
+        decimals: 9,
+        token_program: None,
+    }
+}
+
+fn placeholder_transaction() -> Transaction {
+    Transaction {
+        time: "".to_string(),
+        summary: "No transactions".to_string(),
+        amount: "".to_string(),
+        signature: String::new(),
+        slot: 0,
+        failed: false,
+    }
 }
 
 fn seeded_series(seed: &str, length: usize) -> Vec<f64> {
@@ -3910,6 +4304,302 @@ fn sign_message_with_wallet(wallet_id: &str, message: &str) -> Result<String, Bo
     Ok(signature.to_string())
 }
 
+fn build_send_review(
+    wallet: &WalletEntry,
+    token: &Token,
+    recipient: &str,
+    amount: &str,
+    rpc_url: &str,
+    network: Network,
+) -> Result<SendReview, Box<dyn Error>> {
+    let client = reqwest::blocking::Client::new();
+    let from = Pubkey::from_str(&wallet.address)?;
+    let to = Pubkey::from_str(recipient)?;
+    let raw_amount = decimal_amount_to_raw(amount, token.decimals)?;
+    if raw_amount == 0 {
+        return Err("amount must be greater than zero".into());
+    }
+    validate_available_balance(token, raw_amount)?;
+
+    let (instructions, creates_recipient_ata) =
+        build_send_instructions(&client, rpc_url, &from, &to, token, raw_amount)?;
+    let blockhash = latest_blockhash(&client, rpc_url)?;
+    let mut tx = SolanaTransaction::new_with_payer(&instructions, Some(&from));
+    tx.message.recent_blockhash = blockhash;
+    let simulation_units = simulate_transaction(&client, rpc_url, &tx)?;
+
+    Ok(SendReview {
+        from_wallet_id: wallet.id.clone(),
+        from_name: wallet.name.clone(),
+        from_address: wallet.address.clone(),
+        to_address: recipient.to_string(),
+        asset_symbol: token.symbol.clone(),
+        amount_display: format!("{} {}", amount.trim(), token.symbol),
+        raw_amount,
+        token_mint: token.mint.clone(),
+        token_decimals: token.decimals,
+        creates_recipient_ata,
+        fee_estimate: "default fee (priority fees disabled)".to_string(),
+        simulation_units,
+        network,
+    })
+}
+
+fn broadcast_send(review: &SendReview, rpc_url: &str) -> Result<String, Box<dyn Error>> {
+    let client = reqwest::blocking::Client::new();
+    let secret = load_secret_for_wallet(&review.from_wallet_id)?;
+    let keypair = keypair_from_secret(&secret)?;
+    let from = Pubkey::from_str(&review.from_address)?;
+    if keypair.pubkey() != from {
+        return Err("stored key does not match active wallet address".into());
+    }
+    let to = Pubkey::from_str(&review.to_address)?;
+    let token = Token {
+        symbol: review.asset_symbol.clone(),
+        balance: String::new(),
+        value: String::new(),
+        history: Vec::new(),
+        mint: review.token_mint.clone(),
+        decimals: review.token_decimals,
+        token_program: review
+            .token_mint
+            .as_ref()
+            .map(|_| spl_token::id().to_string()),
+    };
+    let (instructions, _) =
+        build_send_instructions(&client, rpc_url, &from, &to, &token, review.raw_amount)?;
+    let blockhash = latest_blockhash(&client, rpc_url)?;
+    let tx = SolanaTransaction::new_signed_with_payer(
+        &instructions,
+        Some(&from),
+        &[&keypair],
+        blockhash,
+    );
+    send_transaction(&client, rpc_url, &tx)
+}
+
+fn build_send_instructions(
+    client: &reqwest::blocking::Client,
+    rpc_url: &str,
+    from: &Pubkey,
+    to: &Pubkey,
+    token: &Token,
+    raw_amount: u64,
+) -> Result<(Vec<Instruction>, bool), Box<dyn Error>> {
+    let Some(mint_value) = &token.mint else {
+        return Ok((
+            vec![system_instruction::transfer(from, to, raw_amount)],
+            false,
+        ));
+    };
+
+    let mint = Pubkey::from_str(mint_value)?;
+    let token_program = spl_token::id();
+    if let Some(program) = &token.token_program {
+        if program != &token_program.to_string() {
+            return Err("unsupported token program; Token2022 sends are deferred".into());
+        }
+    }
+    validate_spl_token_mint(client, rpc_url, &mint, &token_program)?;
+
+    let source_ata = get_associated_token_address(from, &mint);
+    if !account_exists(client, rpc_url, &source_ata)? {
+        return Err(format!("source token account does not exist for {}", token.symbol).into());
+    }
+
+    let recipient_ata = get_associated_token_address(to, &mint);
+    let creates_recipient_ata = !account_exists(client, rpc_url, &recipient_ata)?;
+    let mut instructions = Vec::new();
+    if creates_recipient_ata {
+        instructions.push(create_associated_token_account_idempotent(
+            from,
+            to,
+            &mint,
+            &token_program,
+        ));
+    }
+    instructions.push(spl_token::instruction::transfer_checked(
+        &token_program,
+        &source_ata,
+        &mint,
+        &recipient_ata,
+        from,
+        &[],
+        raw_amount,
+        token.decimals,
+    )?);
+    Ok((instructions, creates_recipient_ata))
+}
+
+fn validate_spl_token_mint(
+    client: &reqwest::blocking::Client,
+    rpc_url: &str,
+    mint: &Pubkey,
+    token_program: &Pubkey,
+) -> Result<(), Box<dyn Error>> {
+    match account_owner(client, rpc_url, mint)? {
+        Some(owner) if owner == token_program.to_string() => Ok(()),
+        Some(owner) => Err(format!(
+            "unsupported token program {}; Token2022 sends are deferred",
+            short_address(&owner)
+        )
+        .into()),
+        None => Err("token mint account not found".into()),
+    }
+}
+
+fn latest_blockhash(
+    client: &reqwest::blocking::Client,
+    rpc_url: &str,
+) -> Result<Hash, Box<dyn Error>> {
+    let result = rpc_call(
+        client,
+        rpc_url,
+        "getLatestBlockhash",
+        json!([{ "commitment": "confirmed" }]),
+    )?;
+    let blockhash = result
+        .get("value")
+        .and_then(|value| value.get("blockhash"))
+        .and_then(|value| value.as_str())
+        .ok_or("missing latest blockhash")?;
+    Ok(Hash::from_str(blockhash)?)
+}
+
+fn simulate_transaction(
+    client: &reqwest::blocking::Client,
+    rpc_url: &str,
+    tx: &SolanaTransaction,
+) -> Result<Option<u64>, Box<dyn Error>> {
+    let encoded = general_purpose::STANDARD.encode(bincode::serialize(tx)?);
+    let result = rpc_call(
+        client,
+        rpc_url,
+        "simulateTransaction",
+        json!([
+            encoded,
+            {
+                "encoding": "base64",
+                "sigVerify": false,
+                "replaceRecentBlockhash": true,
+                "commitment": "confirmed"
+            }
+        ]),
+    )?;
+    if !result
+        .get("err")
+        .unwrap_or(&serde_json::Value::Null)
+        .is_null()
+    {
+        return Err(format!("simulation failed: {}", result.get("err").unwrap()).into());
+    }
+    Ok(result.get("unitsConsumed").and_then(|value| value.as_u64()))
+}
+
+fn send_transaction(
+    client: &reqwest::blocking::Client,
+    rpc_url: &str,
+    tx: &SolanaTransaction,
+) -> Result<String, Box<dyn Error>> {
+    let encoded = general_purpose::STANDARD.encode(bincode::serialize(tx)?);
+    let result = rpc_call(
+        client,
+        rpc_url,
+        "sendTransaction",
+        json!([
+            encoded,
+            {
+                "encoding": "base64",
+                "skipPreflight": false,
+                "preflightCommitment": "confirmed"
+            }
+        ]),
+    )?;
+    result
+        .as_str()
+        .map(str::to_string)
+        .ok_or_else(|| "missing transaction signature".into())
+}
+
+fn account_exists(
+    client: &reqwest::blocking::Client,
+    rpc_url: &str,
+    pubkey: &Pubkey,
+) -> Result<bool, Box<dyn Error>> {
+    Ok(account_owner(client, rpc_url, pubkey)?.is_some())
+}
+
+fn account_owner(
+    client: &reqwest::blocking::Client,
+    rpc_url: &str,
+    pubkey: &Pubkey,
+) -> Result<Option<String>, Box<dyn Error>> {
+    let result = rpc_call(
+        client,
+        rpc_url,
+        "getAccountInfo",
+        json!([pubkey.to_string(), { "encoding": "base64", "commitment": "confirmed" }]),
+    )?;
+    let Some(value) = result.get("value") else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Ok(None);
+    }
+    Ok(value
+        .get("owner")
+        .and_then(|owner| owner.as_str())
+        .map(str::to_string))
+}
+
+fn decimal_amount_to_raw(input: &str, decimals: u8) -> Result<u64, Box<dyn Error>> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() || trimmed.starts_with('-') {
+        return Err("amount must be a positive decimal".into());
+    }
+    let mut parts = trimmed.split('.');
+    let whole = parts.next().unwrap_or("0");
+    let frac = parts.next().unwrap_or("");
+    if parts.next().is_some()
+        || whole.is_empty()
+        || !whole.chars().all(|ch| ch.is_ascii_digit())
+        || !frac.chars().all(|ch| ch.is_ascii_digit())
+    {
+        return Err("amount must be a positive decimal".into());
+    }
+    if frac.len() > decimals as usize {
+        return Err(format!("amount has more than {} decimal places", decimals).into());
+    }
+    let scale = 10u128.pow(decimals as u32);
+    let whole_raw = whole
+        .parse::<u128>()?
+        .checked_mul(scale)
+        .ok_or("amount too large")?;
+    let mut frac_string = frac.to_string();
+    while frac_string.len() < decimals as usize {
+        frac_string.push('0');
+    }
+    let frac_raw = if frac_string.is_empty() {
+        0
+    } else {
+        frac_string.parse::<u128>()?
+    };
+    let raw = whole_raw.checked_add(frac_raw).ok_or("amount too large")?;
+    if raw > u64::MAX as u128 {
+        return Err("amount too large".into());
+    }
+    Ok(raw as u64)
+}
+
+fn validate_available_balance(token: &Token, raw_amount: u64) -> Result<(), Box<dyn Error>> {
+    let balance_raw = decimal_amount_to_raw(&token.balance, token.decimals).unwrap_or(0);
+    let reserve = if token.mint.is_none() { 5_000 } else { 0 };
+    if raw_amount.saturating_add(reserve) > balance_raw {
+        return Err("amount exceeds displayed balance".into());
+    }
+    Ok(())
+}
+
 fn resolve_api_key(config: &DenConfig) -> Option<String> {
     std::env::var("HELIUS_API_KEY")
         .ok()
@@ -3940,17 +4630,8 @@ fn build_refresh_snapshot(network: Network) -> Result<RefreshSnapshot, Box<dyn E
     let mut wallet_address = "Unset".to_string();
     let mut active_wallet_id = None;
     let mut total_balance = "0.00 SOL".to_string();
-    let mut tokens = vec![Token {
-        symbol: "SOL".to_string(),
-        balance: "0.00".to_string(),
-        value: "-".to_string(),
-        history: Vec::new(),
-    }];
-    let mut history = vec![Transaction {
-        time: "".to_string(),
-        summary: "No transactions".to_string(),
-        amount: "".to_string(),
-    }];
+    let mut tokens = vec![placeholder_sol_token()];
+    let mut history = vec![placeholder_transaction()];
 
     let Some(api_key) = resolve_api_key(&den_config) else {
         let accounts = den_config
@@ -4022,11 +4703,7 @@ fn build_refresh_snapshot(network: Network) -> Result<RefreshSnapshot, Box<dyn E
                 }
                 tokens = data.tokens;
                 history = if data.history.is_empty() {
-                    vec![Transaction {
-                        time: "".to_string(),
-                        summary: "No transactions".to_string(),
-                        amount: "".to_string(),
-                    }]
+                    vec![placeholder_transaction()]
                 } else {
                     data.history
                 };
@@ -4111,7 +4788,10 @@ fn das_get_assets(
         symbol: "SOL".to_string(),
         balance: format!("{:.4}", sol_balance),
         value: sol_value,
-        history: seeded_series("SOL", 16),
+        history: Vec::new(),
+        mint: None,
+        decimals: 9,
+        token_program: None,
     }];
 
     // Fungible tokens from DAS
@@ -4163,7 +4843,16 @@ fn das_get_assets(
                 symbol: display_symbol.clone(),
                 balance: format_token_balance(ui_balance, decimals),
                 value,
-                history: seeded_series(&display_symbol, 16),
+                history: Vec::new(),
+                mint: item
+                    .get("id")
+                    .and_then(|id| id.as_str())
+                    .map(str::to_string),
+                decimals: decimals.min(u8::MAX as u64) as u8,
+                token_program: token_info
+                    .get("token_program")
+                    .and_then(|program| program.as_str())
+                    .map(str::to_string),
             });
         }
     }
@@ -4212,6 +4901,9 @@ fn rpc_get_history(
                     format!("Tx {}", short_address(signature))
                 },
                 amount: "-".to_string(),
+                signature: signature.to_string(),
+                slot,
+                failed,
             });
         }
     }

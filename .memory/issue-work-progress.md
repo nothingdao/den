@@ -55,14 +55,41 @@ Commit: 5129622 feat: add clipboard copy and receive QR (#12)
 Blockers: none
 
 ## #8 Implement SOL and SPL send flows
-Status: blocked/not started.
-Blocker:
-- A complete SOL/SPL send flow requires security/product decisions before implementation: exact confirmation UX, simulation/blocking policy, priority-fee policy, token-account/ATA behavior, versioned transaction scope, and SPL token program/Token2022 support boundaries.
-- Watch-only signing restrictions are clear, but implementing transaction construction/sign/broadcast without approved review/simulation decisions would be unsafe.
-Checks: not run for #8 because no code changes were made.
-Commit: none.
+Status: completed with approved conservative scope.
+Changes:
+- Added TUI send flow from the Send tab: choose asset with Up/Down, enter recipient, enter amount, simulate, review, then type `SEND` to sign/broadcast.
+- Added SOL transfers using legacy transactions and default Solana fees.
+- Added SPL Token transfers with source ATA validation and recipient ATA creation when missing.
+- Blocked watch-only wallets before send entry.
+- Blocked Token2022/unsupported-token-program sends until asset support is validated.
+- Broadcast uses preflight and reports the resulting signature in status/last-signature.
+- Updated SPEC.md, README.md, and architecture docs.
+Checks:
+- cargo fmt: passed
+- cargo test: passed (0 tests; warnings)
+- cargo build: passed (warnings)
+- cargo clippy: passed with warnings
+Commit: pending in this run.
+Blockers: none for approved #8 scope.
 
-## #9/#10/#13/#14/#15
-Status: not started in this run.
-Reason: stopped at #8 per safety instruction rather than skipping ahead after identifying send-flow security/product blockers.
+## #9 Add transaction detail, simulation, and confirmation review
+Status: completed with #8 vertical slice.
+Changes:
+- Added reusable transaction review screen for sends.
+- Added required simulation before review; simulation failures block sending with no override.
+- Added typed confirmation before signing/broadcast.
+- Added transaction detail view for history rows with status, slot, summary, amount, and signature.
+- Added copy support for selected/detail transaction signatures.
+- Updated SPEC.md, README.md, and architecture docs.
+Checks:
+- cargo fmt: passed
+- cargo test: passed (0 tests; warnings)
+- cargo build: passed (warnings)
+- cargo clippy: passed with warnings
+Commit: pending in this run.
+Blockers: none for approved #9 scope.
+
+## #10/#13/#14/#15
+Status: not started in this run yet.
+Reason: #8/#9 vertical slice completed first due safety-critical send/review dependency.
 

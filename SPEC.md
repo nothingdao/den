@@ -31,11 +31,11 @@ Feature/source-of-truth status for the current app.
 ## Transactions
 
 - Done: Recent transaction history list
-- Pending: Send SOL
-- Pending: Send SPL tokens
-- Pending: Transaction detail view
-- Pending: Confirmation/review flow
-- Pending: Simulation
+- Done: Send SOL
+- Done: Send SPL tokens (SPL Token only; Token2022 sends blocked until validation)
+- Done: Transaction detail view
+- Done: Confirmation/review flow
+- Done: Simulation before broadcast (failures block sending)
 - Pending: Priority fees
 - Pending: Versioned transactions
 - Pending: Devnet airdrop
@@ -43,7 +43,7 @@ Feature/source-of-truth status for the current app.
 ## Signing
 
 - Done: Sign arbitrary message
-- Pending: Sign transaction
+- Done: Sign transaction for reviewed send flow
 
 ## Network
 
@@ -87,5 +87,5 @@ Feature/source-of-truth status for the current app.
 
 ## Known Gaps
 
-- Send flow remains mostly static
-- Chart data is still seeded/fake
+- Token2022 sends remain disabled until asset support is validated
+- Chart data is unavailable rather than real historical charting

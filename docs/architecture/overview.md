@@ -12,6 +12,7 @@ Den is currently implemented primarily in `src/main.rs`. Application state, TUI 
 - Config: local file backend plus optional Bitwarden-backed sync
 - Contacts: persisted contact list with JSON import/export
 - Network data: Helius requests for balances, tokens, and history run on a background refresh worker
+- Transactions: send flows build legacy SOL/SPL Token transactions, simulate before review, then sign/broadcast only after typed confirmation
 - Release: GitHub Actions builds macOS binaries and publishes release assets used by Homebrew
 
 ## State Model
@@ -42,6 +43,21 @@ user action
 ```
 
 Requests still use blocking reqwest internally, but refresh work runs off the UI thread so keyboard input and redraws continue while loading.
+
+Send flow:
+
+```text
+Send tab
+-> choose SOL/SPL Token asset
+-> enter recipient + amount
+-> build legacy transaction instructions
+-> simulate unsigned transaction with sigVerify=false
+-> require review screen + typed SEND confirmation
+-> load signing key from Keychain
+-> sign and broadcast with preflight enabled
+```
+
+Watch-only wallets are blocked before send entry. Token2022 sends are intentionally blocked until asset support is validated.
 
 ## Storage
 
