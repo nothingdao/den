@@ -4,11 +4,14 @@
 
 Den is currently implemented primarily in `src/main.rs`, with theme loading isolated in `src/theme.rs`. Application state, TUI rendering, CLI handling, config logic, wallet management, contacts, and network fetches still mostly live in the main module.
 
+The product direction is for Den to become the local wallet authority for multiple clients. The TUI/CLI remains first-class, while a future local daemon exposes a documented, versioned API for browser extensions, scripts, and other clients. See `product-ecosystem.md`, `daemon-api.md`, and `key-storage-api.md`.
+
 ## Major Subsystems
 
 - TUI: Ratatui/Crossterm rendering, keyboard handling, responsive header tabs/compact navigation, opaque modals
 - CLI: headless wallet/config/contact commands exposed through `den --help`
 - Wallets: full wallets and watch-only wallets, with active-wallet selection, random key generation, and 12-word seed phrase create/restore
+- Future daemon/client ecosystem: local-only API, terminal-authorized extension sessions, documented wallet/signing APIs
 - Config: local file backend plus optional Bitwarden-backed sync
 - Contacts: persisted contact list with JSON import/export
 - Network data: Helius requests for balances, tokens, NFTs, and history run on a background refresh worker; custom RPC supports standard RPC balance/history/sends without DAS metadata
@@ -63,8 +66,9 @@ Watch-only wallets are blocked before send entry. Token2022/non-SPL Token sends 
 
 ### Secrets
 
-- Private keys live in macOS Keychain via `keyring`
+- Private keys currently live in macOS Keychain via `keyring`
 - Seed phrases for mnemonic-created/restored wallets are also stored in Keychain and only revealed after typing `REVEAL`
+- Future key storage should be provider-based, with macOS Keychain as one backend rather than the only possible storage solution
 
 ### Config
 
@@ -98,3 +102,9 @@ GitHub release assets
 ```
 
 The binary users run is `den`.
+
+## Related Design Docs
+
+- `product-ecosystem.md` — Den TUI/daemon/browser-extension product roles
+- `daemon-api.md` — proposed documented local API for Den clients
+- `key-storage-api.md` — provider abstraction for Keychain, encrypted files, hardware signers, and other backends

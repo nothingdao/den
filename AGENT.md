@@ -66,6 +66,8 @@ docs/architecture/overview.md         — architecture notes
 
 ## Important Behaviors
 
+- Den is the planned local wallet authority for the ecosystem; browser clients should connect to Den/daemon and should not store private keys.
+- The daemon API and key-storage provider API are design targets documented under `docs/architecture/`.
 - `src/main.rs` is still the primary implementation file, with theme helpers split into `src/theme.rs`.
 - Network fetches are blocking, so refreshes can freeze the UI briefly.
 - `--set-api-key` stores the API key in config, not Keychain.

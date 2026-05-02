@@ -2,6 +2,8 @@
 
 Terminal wallet dashboard for Solana, built with Ratatui. It can show live balances and recent activity via Helius, or run in a placeholder mode when no credentials are set.
 
+Den is also the planned local wallet authority for the broader Den ecosystem: the TUI/CLI owns wallet management and secret storage, a future local daemon will expose a documented API, and browser clients such as `den-browser-extension` will connect to Den instead of storing keys themselves.
+
 ## Install
 
 Install via Homebrew:
@@ -22,6 +24,7 @@ den
 ```
 
 ## Features
+- Local wallet authority for Den clients, with daemon/API design in progress
 - Multi-tab wallet overview (accounts, tokens, history, address book, settings)
 - Live balance + token fetch from Helius RPC with non-blocking TUI refreshes
 - Keychain-backed key import, generation, and 12-word seed wallet restore (macOS)
@@ -65,7 +68,9 @@ If you have not installed the binary yet, prefix the same commands with `cargo r
 
 ## Configuration
 
-Wallet secrets are stored in macOS Keychain. Config can be local or centralized in Bitwarden.
+Wallet secrets are currently stored in macOS Keychain. Config can be local or centralized in Bitwarden.
+
+Longer-term, Den will define a key-storage provider API so Apple Keychain is only the macOS default, not the only possible backend. Planned providers may include platform secret stores, encrypted local files, Bitwarden, and hardware signers. See `docs/architecture/key-storage-api.md`.
 
 | Storage | Location | Contents |
 |---------|----------|----------|
@@ -110,6 +115,24 @@ Configuration:
 --config-path           Show active config location
 --status                Show full status
 ```
+
+## Product Ecosystem / Daemon API
+
+The browser extension should be a thin Den client, not an independent wallet. When the daemon work lands, the extension will show wallet state and dApp approval UI while Den owns keys, permissions, and signing.
+
+Design docs:
+
+- `docs/architecture/product-ecosystem.md`
+- `docs/architecture/daemon-api.md`
+- `docs/architecture/key-storage-api.md`
+
+Daemon API goals:
+
+- documented, versioned local API for any client to build against
+- terminal-authorized client sessions
+- wallet CRUD for non-secret operations
+- signing APIs that never expose private keys
+- key-storage provider abstraction, not macOS-only design
 
 ## Feature Status
 
