@@ -153,3 +153,22 @@ Checks:
 Commit: b05063a feat: complete key asset rpc and theme work (#10 #13 #14 #15)
 Blockers: further modularization should be done as smaller follow-up PRs/modules.
 
+
+## #16 Responsive TUI design pass: mobile layout, single navigation, opaque overlays
+Status: completed, pending manual QA.
+Changes:
+- Removed the duplicate wide sidebar navigation; navigation now uses header tabs on medium/wide widths and a compact header below 60 columns.
+- Added explicit compact/medium/wide breakpoints and compact list-style views for accounts/tokens plus a no-QR compact receive view.
+- Kept split layouts only for medium/wide widths where they fit; compact layouts stack/simplify content.
+- Made onboarding, input, mnemonic backup, and secret reveal modals opaque with `Clear` plus filled modal backgrounds.
+- Hardened modal sizing so modal rectangles fit inside very small terminals.
+- Updated README.md, SPEC.md, and architecture docs.
+Checks:
+- cargo fmt: passed
+- cargo test: passed (0 tests)
+- cargo build: passed
+- cargo clippy: passed with existing warnings
+- cargo install --path . --force: passed; installed `/Users/josh/.cargo/bin/den`
+Commit: b906112 feat: improve responsive TUI layout (#16)
+Caveats:
+- Manual QA is still recommended before closing #16, especially at 40x20, 60x24, 80x24, and 100x30 terminal sizes.

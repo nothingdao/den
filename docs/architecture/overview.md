@@ -6,7 +6,7 @@ Den is currently implemented primarily in `src/main.rs`, with theme loading isol
 
 ## Major Subsystems
 
-- TUI: Ratatui/Crossterm rendering, keyboard handling, tabs, modals
+- TUI: Ratatui/Crossterm rendering, keyboard handling, responsive header tabs/compact navigation, opaque modals
 - CLI: headless wallet/config/contact commands exposed through `den --help`
 - Wallets: full wallets and watch-only wallets, with active-wallet selection, random key generation, and 12-word seed phrase create/restore
 - Config: local file backend plus optional Bitwarden-backed sync

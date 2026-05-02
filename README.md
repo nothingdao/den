@@ -187,11 +187,11 @@ Configuration:
 
 | Feature | Status | Notes |
 |---------|--------|-------|
-| Tab navigation (1-8) | Done | |
-| Sidebar nav | Done | Hidden below 70 col width |
-| Responsive layout | Done | Breakpoints at 60, 70, 90 col |
-| Keyboard shortcuts | Done | |
-| Input modals | Done | Import key, sign message |
+| Tab navigation (1-8) | Done | Header tabs on medium/wide widths; compact header on mobile/narrow widths |
+| Sidebar nav | Removed | Single navigation model; no duplicate sidebar/header menus |
+| Responsive layout | Done | Compact below 60 cols, medium below 90 cols, wide at 90+ cols |
+| Keyboard shortcuts | Done | Footer/status hints preserve shortcut discoverability |
+| Input modals | Done | Opaque/cleared backgrounds for readability |
 | Status bar with context colors | Done | Error/success/info coloring |
 | Color theme | Done | Loaded from `~/.config/den/theme.toml`, hot-reloads on file change |
 | Copy address to clipboard | Done | Press `c` in wallet/contact/receive contexts |

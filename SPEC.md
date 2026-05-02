@@ -70,9 +70,9 @@ Feature/source-of-truth status for the current app.
 
 ## TUI / UX
 
-- Done: Tab navigation and responsive layout
-- Done: Sidebar navigation
-- Done: Status bar and modal flows
+- Done: Tab navigation and responsive layout (compact below 60 columns, medium below 90, wide at 90+)
+- Done: Single navigation model (header tabs/compact header; duplicate sidebar removed)
+- Done: Status bar and opaque modal flows
 - Done: Configurable color theme (loaded from `~/.config/den/theme.toml`, hot-reloads on file change ~250ms)
 - Done: Clipboard copy for wallet/contact receive addresses
 - Done: QR display for receive address

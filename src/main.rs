@@ -19,7 +19,7 @@ use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::prelude::{Backend, CrosstermBackend, Terminal};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph, Row, Table, Tabs};
+use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Row, Table, Tabs, Wrap};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use solana_derivation_path::DerivationPath;
@@ -45,6 +45,9 @@ const BW_CONFIG_ITEM_ID_ENV: &str = "DEN_BW_CONFIG_ITEM_ID";
 const RAW_KEY_ORIGIN: &str = "raw";
 const MNEMONIC_KEY_ORIGIN: &str = "mnemonic";
 const DEFAULT_DERIVATION_PATH: &str = "m/44'/501'/0'/0'";
+const COMPACT_WIDTH: u16 = 60;
+const MEDIUM_WIDTH: u16 = 90;
+const QR_MIN_WIDTH: u16 = 58;
 
 static CONFIG_REV: OnceLock<Mutex<Option<String>>> = OnceLock::new();
 static BW_SESSION_CACHE: OnceLock<Mutex<Option<String>>> = OnceLock::new();
@@ -85,6 +88,19 @@ impl Tab {
             Tab::History => "History",
             Tab::AddressBook => "Address Book",
             Tab::Settings => "Settings",
+        }
+    }
+
+    fn short_title(self) -> &'static str {
+        match self {
+            Tab::Overview => "Ov",
+            Tab::Accounts => "Acct",
+            Tab::Tokens => "Tok",
+            Tab::Send => "Send",
+            Tab::Receive => "Recv",
+            Tab::History => "Hist",
+            Tab::AddressBook => "Addr",
+            Tab::Settings => "Set",
         }
     }
 
@@ -2335,23 +2351,37 @@ fn render_header(
     width: u16,
     network: Network,
 ) {
-    if width < 60 {
-        let title = format!("Den Wallet | {} | {}", tab.title(), network.label());
+    if width < COMPACT_WIDTH {
+        let title = format!(
+            "Den | {} {} | {}",
+            tab.index() + 1,
+            tab.short_title(),
+            network.label()
+        );
         let header = Paragraph::new(title)
             .alignment(Alignment::Center)
             .block(
                 Block::default()
                     .borders(Borders::ALL)
-                    .border_style(Style::default().fg(theme().border)),
+                    .border_style(Style::default().fg(theme().border))
+                    .title("1-8 nav"),
             )
             .style(Style::default().fg(theme().fg));
         frame.render_widget(header, area);
         return;
     }
 
+    let use_short_titles = width < MEDIUM_WIDTH;
     let titles = Tab::ALL
         .iter()
-        .map(|t| Line::from(Span::styled(t.title(), Style::default().fg(theme().fg))))
+        .map(|t| {
+            let label = if use_short_titles {
+                t.short_title()
+            } else {
+                t.title()
+            };
+            Line::from(Span::styled(label, Style::default().fg(theme().fg)))
+        })
         .collect::<Vec<_>>();
 
     let tabs = Tabs::new(titles)
@@ -2378,93 +2408,66 @@ fn render_header(
 }
 
 fn render_body(frame: &mut ratatui::prelude::Frame, area: Rect, app: &App, width: u16) {
-    if width < 70 {
-        render_main(frame, area, app, width);
-        return;
-    }
-
-    let layout = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Length(24), Constraint::Min(0)])
-        .split(area);
-
-    render_sidebar(frame, layout[0], app.tab);
-    render_main(frame, layout[1], app, width);
-}
-
-fn render_sidebar(frame: &mut ratatui::prelude::Frame, area: Rect, tab: Tab) {
-    let items = Tab::ALL
-        .iter()
-        .enumerate()
-        .map(|(index, t)| {
-            let label = format!("{}. {}", index + 1, t.title());
-            ListItem::new(Line::from(label))
-        })
-        .collect::<Vec<_>>();
-
-    let list = List::new(items)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(theme().border))
-                .title("Sections (1-8)"),
-        )
-        .highlight_style(
-            Style::default()
-                .fg(theme().sel_fg)
-                .bg(theme().accent)
-                .add_modifier(Modifier::BOLD),
-        )
-        .highlight_symbol("> ")
-        .style(Style::default().fg(theme().fg));
-
-    frame.render_stateful_widget(list, area, &mut list_state(tab.index()));
+    render_main(frame, area, app, width);
 }
 
 fn render_main(frame: &mut ratatui::prelude::Frame, area: Rect, app: &App, width: u16) {
     match app.tab {
         Tab::Overview => render_overview(frame, area, app, width),
-        Tab::Accounts => render_accounts(frame, area, app),
+        Tab::Accounts => render_accounts(frame, area, app, width),
         Tab::Tokens => render_tokens_view(frame, area, app, width),
-        Tab::Send => render_send(frame, area, app),
-        Tab::Receive => render_receive(frame, area, app),
+        Tab::Send => render_send(frame, area, app, width),
+        Tab::Receive => render_receive(frame, area, app, width),
         Tab::History => render_history(frame, area, app),
         Tab::AddressBook => render_address_book(frame, area, app),
-        Tab::Settings => render_settings(frame, area, app),
+        Tab::Settings => render_settings(frame, area, app, width),
     }
 }
 
 fn render_overview(frame: &mut ratatui::prelude::Frame, area: Rect, app: &App, width: u16) {
+    let compact = width < COMPACT_WIDTH || area.height < 18;
+    let summary_height = if compact { 6 } else { 10 };
     let layout = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(9), Constraint::Min(0)])
+        .constraints([Constraint::Length(summary_height), Constraint::Min(0)])
         .split(area);
 
-    let art = [
-        "__         __",
-        "/  \\.-\"\"\"-.//  \\",
-        "\\    -   -    /",
-        " |   o   o   |",
-        " \\  .-'''-.  /",
-        "  '-\\__Y__/-'",
-        "     `---`",
-    ];
+    let overview = if compact {
+        Text::from(vec![
+            Line::from(format!("Total: {}", app.total_balance)),
+            Line::from(format!(
+                "Accounts: {} | Tokens: {}",
+                app.accounts.len(),
+                app.tokens.len()
+            )),
+            Line::from(format!("Data: {}", app.refresh_status_label())),
+            Line::from("1-8 switches sections"),
+        ])
+    } else {
+        let art = [
+            "__         __",
+            "/  \\.-\"\"\"-.//  \\",
+            "\\    -   -    /",
+            " |   o   o   |",
+            " \\  .-'''-.  /",
+        ];
 
-    let overview = Text::from(
-        art.iter()
-            .map(|line| Line::from(*line))
-            .chain([
-                Line::from(""),
-                Line::from(format!("Total Balance: {}", app.total_balance)),
-                Line::from(format!(
-                    "Accounts: {} | Tokens: {}",
-                    app.accounts.len(),
-                    app.tokens.len()
-                )),
-                Line::from(format!("Data: {}", app.refresh_status_label())),
-            ])
-            .collect::<Vec<_>>(),
-    );
+        Text::from(
+            art.iter()
+                .map(|line| Line::from(*line))
+                .chain([
+                    Line::from(""),
+                    Line::from(format!("Total Balance: {}", app.total_balance)),
+                    Line::from(format!(
+                        "Accounts: {} | Tokens: {}",
+                        app.accounts.len(),
+                        app.tokens.len()
+                    )),
+                    Line::from(format!("Data: {}", app.refresh_status_label())),
+                ])
+                .collect::<Vec<_>>(),
+        )
+    };
 
     let paragraph = Paragraph::new(overview)
         .alignment(Alignment::Center)
@@ -2478,26 +2481,70 @@ fn render_overview(frame: &mut ratatui::prelude::Frame, area: Rect, app: &App, w
 
     frame.render_widget(paragraph, layout[0]);
 
-    if width < 90 {
+    if width < MEDIUM_WIDTH {
         let bottom = Layout::default()
             .direction(Direction::Vertical)
             .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
             .split(layout[1]);
-        render_tokens_table(frame, bottom[0], app);
+        render_tokens_table(frame, bottom[0], app, width);
         render_history_list(frame, bottom[1], app);
     } else {
         let bottom = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
             .split(layout[1]);
-        render_tokens_table(frame, bottom[0], app);
+        render_tokens_table(frame, bottom[0], app, width);
         render_history_list(frame, bottom[1], app);
     }
 }
 
-fn render_accounts(frame: &mut ratatui::prelude::Frame, area: Rect, app: &App) {
+fn render_accounts(frame: &mut ratatui::prelude::Frame, area: Rect, app: &App, width: u16) {
     if let Some(index) = app.wallet_detail_index {
         render_wallet_detail(frame, area, app, index);
+        return;
+    }
+
+    let title = if width < COMPACT_WIDTH {
+        "Wallets [Enter details | g/m/p/w]"
+    } else {
+        "Wallets [a:import g:generate m:seed p:restore w:watch x:reveal]"
+    };
+
+    if width < COMPACT_WIDTH {
+        let items = app
+            .accounts
+            .iter()
+            .map(|account| {
+                let marker = if account.is_active { "*" } else { " " };
+                let wallet_type = if account.has_key { "Full" } else { "Watch" };
+                ListItem::new(Text::from(vec![
+                    Line::from(format!("{} {} ({})", marker, account.name, wallet_type)),
+                    Line::from(format!(
+                        "  {}  {}",
+                        short_address(&account.address),
+                        account.balance
+                    )),
+                ]))
+            })
+            .collect::<Vec<_>>();
+
+        let list = List::new(items)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(theme().border))
+                    .title(title),
+            )
+            .highlight_style(
+                Style::default()
+                    .fg(theme().sel_fg)
+                    .bg(theme().accent)
+                    .add_modifier(Modifier::BOLD),
+            )
+            .highlight_symbol("> ")
+            .style(Style::default().fg(theme().fg));
+
+        frame.render_stateful_widget(list, area, &mut list_state(app.selected_account));
         return;
     }
 
@@ -2533,7 +2580,7 @@ fn render_accounts(frame: &mut ratatui::prelude::Frame, area: Rect, app: &App) {
         Block::default()
             .borders(Borders::ALL)
             .border_style(Style::default().fg(theme().border))
-            .title("Wallets [a:import g:generate m:seed p:restore w:watch x:reveal]"),
+            .title(title),
     )
     .row_highlight_style(
         Style::default()
@@ -2638,6 +2685,7 @@ fn render_wallet_detail(frame: &mut ratatui::prelude::Frame, area: Rect, app: &A
     ]);
 
     let paragraph = Paragraph::new(info)
+        .wrap(Wrap { trim: false })
         .block(
             Block::default()
                 .borders(Borders::ALL)
@@ -2701,6 +2749,7 @@ fn render_wallet_detail(frame: &mut ratatui::prelude::Frame, area: Rect, app: &A
     ]);
 
     let actions = Paragraph::new(hints)
+        .wrap(Wrap { trim: false })
         .block(
             Block::default()
                 .borders(Borders::ALL)
@@ -2713,12 +2762,12 @@ fn render_wallet_detail(frame: &mut ratatui::prelude::Frame, area: Rect, app: &A
 }
 
 fn render_tokens_view(frame: &mut ratatui::prelude::Frame, area: Rect, app: &App, width: u16) {
-    if width < 90 {
+    if width < MEDIUM_WIDTH {
         let layout = Layout::default()
             .direction(Direction::Vertical)
             .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
             .split(area);
-        render_tokens_table(frame, layout[0], app);
+        render_tokens_table(frame, layout[0], app, width);
         render_token_chart(frame, layout[1], app);
         return;
     }
@@ -2727,11 +2776,47 @@ fn render_tokens_view(frame: &mut ratatui::prelude::Frame, area: Rect, app: &App
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(58), Constraint::Percentage(42)])
         .split(area);
-    render_tokens_table(frame, layout[0], app);
+    render_tokens_table(frame, layout[0], app, width);
     render_token_chart(frame, layout[1], app);
 }
 
-fn render_tokens_table(frame: &mut ratatui::prelude::Frame, area: Rect, app: &App) {
+fn render_tokens_table(frame: &mut ratatui::prelude::Frame, area: Rect, app: &App, width: u16) {
+    if width < COMPACT_WIDTH {
+        let items = app
+            .tokens
+            .iter()
+            .map(|token| {
+                ListItem::new(Text::from(vec![
+                    Line::from(format!("{}  {}", token.symbol, token.value)),
+                    Line::from(format!(
+                        "  {}  {}",
+                        token.balance,
+                        token_program_label(token)
+                    )),
+                ]))
+            })
+            .collect::<Vec<_>>();
+
+        let list = List::new(items)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(theme().border))
+                    .title("Tokens"),
+            )
+            .highlight_style(
+                Style::default()
+                    .fg(theme().sel_fg)
+                    .bg(theme().accent)
+                    .add_modifier(Modifier::BOLD),
+            )
+            .highlight_symbol("> ")
+            .style(Style::default().fg(theme().fg));
+
+        frame.render_stateful_widget(list, area, &mut list_state(app.selected_token));
+        return;
+    }
+
     let rows = app.tokens.iter().map(|token| {
         Row::new(vec![
             ratatui::widgets::Cell::from(token.symbol.clone()),
@@ -2815,6 +2900,7 @@ fn render_token_chart(frame: &mut ratatui::prelude::Frame, area: Rect, app: &App
 
     frame.render_widget(
         Paragraph::new(Text::from(lines))
+            .wrap(Wrap { trim: false })
             .block(
                 Block::default()
                     .borders(Borders::ALL)
@@ -2930,6 +3016,7 @@ fn render_transaction_detail(
     ]);
 
     let paragraph = Paragraph::new(info)
+        .wrap(Wrap { trim: false })
         .block(
             Block::default()
                 .borders(Borders::ALL)
@@ -3030,6 +3117,7 @@ fn render_contact_detail(frame: &mut ratatui::prelude::Frame, area: Rect, app: &
     ]);
 
     let paragraph = Paragraph::new(info)
+        .wrap(Wrap { trim: false })
         .block(
             Block::default()
                 .borders(Borders::ALL)
@@ -3090,6 +3178,7 @@ fn render_contact_detail(frame: &mut ratatui::prelude::Frame, area: Rect, app: &
     ]);
 
     let actions = Paragraph::new(hints)
+        .wrap(Wrap { trim: false })
         .block(
             Block::default()
                 .borders(Borders::ALL)
@@ -3101,7 +3190,7 @@ fn render_contact_detail(frame: &mut ratatui::prelude::Frame, area: Rect, app: &
     frame.render_widget(actions, layout[1]);
 }
 
-fn render_send(frame: &mut ratatui::prelude::Frame, area: Rect, app: &App) {
+fn render_send(frame: &mut ratatui::prelude::Frame, area: Rect, app: &App, width: u16) {
     if let Some(review) = &app.pending_send {
         render_send_review(frame, area, review);
         return;
@@ -3137,14 +3226,21 @@ fn render_send(frame: &mut ratatui::prelude::Frame, area: Rect, app: &App) {
         "SOL".to_string()
     };
 
-    let layout = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(8),
-            Constraint::Length(7),
-            Constraint::Min(0),
-        ])
-        .split(area);
+    let layout = if width < COMPACT_WIDTH {
+        Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(8), Constraint::Min(0)])
+            .split(area)
+    } else {
+        Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(8),
+                Constraint::Length(7),
+                Constraint::Min(0),
+            ])
+            .split(area)
+    };
 
     let fields = Text::from(vec![
         Line::from(format!("From:   {} ({})", account_name, account_address)),
@@ -3161,20 +3257,25 @@ fn render_send(frame: &mut ratatui::prelude::Frame, area: Rect, app: &App) {
         Line::from("SPL Token: recipient ATA is created when missing"),
     ]);
 
-    let actions = Paragraph::new(
-        "Up/Down: choose asset   Enter: enter recipient/amount   Esc: cancel review",
-    )
-    .alignment(Alignment::Center)
-    .block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(theme().border))
-            .title("Actions"),
-    )
-    .style(Style::default().fg(theme().fg));
+    let actions_text = if width < COMPACT_WIDTH {
+        "Up/Down asset | Enter send | Esc cancel"
+    } else {
+        "Up/Down: choose asset   Enter: enter recipient/amount   Esc: cancel review"
+    };
+    let actions = Paragraph::new(actions_text)
+        .alignment(Alignment::Center)
+        .wrap(Wrap { trim: true })
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(theme().border))
+                .title("Actions"),
+        )
+        .style(Style::default().fg(theme().fg));
 
     frame.render_widget(
         Paragraph::new(fields)
+            .wrap(Wrap { trim: false })
             .block(
                 Block::default()
                     .borders(Borders::ALL)
@@ -3184,18 +3285,41 @@ fn render_send(frame: &mut ratatui::prelude::Frame, area: Rect, app: &App) {
             .style(Style::default().fg(theme().fg)),
         layout[0],
     );
-    frame.render_widget(
-        Paragraph::new(details)
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .border_style(Style::default().fg(theme().border))
-                    .title("Details"),
-            )
-            .style(Style::default().fg(theme().fg)),
-        layout[1],
-    );
-    frame.render_widget(actions, layout[2]);
+    if width < COMPACT_WIDTH {
+        let compact_details = Text::from(vec![
+            Line::from(format!("Network: {}", app.network.label())),
+            Line::from("Simulation required; failures block sending"),
+            Line::from("Default fee; SPL ATA created when missing"),
+            Line::from(""),
+            Line::from(actions_text),
+        ]);
+        frame.render_widget(
+            Paragraph::new(compact_details)
+                .wrap(Wrap { trim: true })
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_style(Style::default().fg(theme().border))
+                        .title("Details"),
+                )
+                .style(Style::default().fg(theme().fg)),
+            layout[1],
+        );
+    } else {
+        frame.render_widget(
+            Paragraph::new(details)
+                .wrap(Wrap { trim: true })
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_style(Style::default().fg(theme().border))
+                        .title("Details"),
+                )
+                .style(Style::default().fg(theme().fg)),
+            layout[1],
+        );
+        frame.render_widget(actions, layout[2]);
+    }
 }
 
 fn render_send_review(frame: &mut ratatui::prelude::Frame, area: Rect, review: &SendReview) {
@@ -3267,6 +3391,7 @@ fn render_send_review(frame: &mut ratatui::prelude::Frame, area: Rect, review: &
         Line::from("  Press Enter, then type SEND to sign and broadcast. Esc cancels."),
     ]);
     let paragraph = Paragraph::new(content)
+        .wrap(Wrap { trim: false })
         .block(
             Block::default()
                 .borders(Borders::ALL)
@@ -3277,23 +3402,24 @@ fn render_send_review(frame: &mut ratatui::prelude::Frame, area: Rect, review: &
     frame.render_widget(paragraph, area);
 }
 
-fn render_receive(frame: &mut ratatui::prelude::Frame, area: Rect, app: &App) {
+fn render_receive(frame: &mut ratatui::prelude::Frame, area: Rect, app: &App, width: u16) {
     let (account_name, account_address) = active_account_full(app);
-
-    let layout = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(6), Constraint::Min(0)])
-        .split(area);
 
     let receive = Text::from(vec![
         Line::from(format!("Account: {}", account_name)),
         Line::from(format!("Address: {}", account_address)),
         Line::from("Memo: (optional)"),
         Line::from("Press c to copy the receive address."),
+        Line::from(if width < QR_MIN_WIDTH {
+            "QR hidden at compact widths; widen terminal to scan."
+        } else {
+            "QR shown below."
+        }),
     ]);
 
     let details = Paragraph::new(receive)
         .alignment(Alignment::Left)
+        .wrap(Wrap { trim: false })
         .block(
             Block::default()
                 .borders(Borders::ALL)
@@ -3301,6 +3427,16 @@ fn render_receive(frame: &mut ratatui::prelude::Frame, area: Rect, app: &App) {
                 .title("Receive"),
         )
         .style(Style::default().fg(theme().fg));
+
+    if width < QR_MIN_WIDTH {
+        frame.render_widget(details, area);
+        return;
+    }
+
+    let layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(7), Constraint::Min(0)])
+        .split(area);
 
     let qr = Paragraph::new(qr_text(&account_address))
         .alignment(Alignment::Center)
@@ -3316,7 +3452,7 @@ fn render_receive(frame: &mut ratatui::prelude::Frame, area: Rect, app: &App) {
     frame.render_widget(qr, layout[1]);
 }
 
-fn render_settings(frame: &mut ratatui::prelude::Frame, area: Rect, app: &App) {
+fn render_settings(frame: &mut ratatui::prelude::Frame, area: Rect, app: &App, width: u16) {
     let active_name = app
         .accounts
         .iter()
@@ -3333,6 +3469,11 @@ fn render_settings(frame: &mut ratatui::prelude::Frame, area: Rect, app: &App) {
         .custom_rpc_url
         .as_deref()
         .unwrap_or("not set");
+    let custom_rpc_display = if width < COMPACT_WIDTH && custom_rpc != "not set" {
+        short_display(custom_rpc, 28)
+    } else {
+        custom_rpc.to_string()
+    };
 
     let layout = Layout::default()
         .direction(Direction::Vertical)
@@ -3359,7 +3500,7 @@ fn render_settings(frame: &mut ratatui::prelude::Frame, area: Rect, app: &App) {
         ]),
         Line::from(vec![
             Span::styled("  Custom RPC: ", Style::default().fg(theme().fg_dim)),
-            Span::styled(custom_rpc, Style::default().fg(theme().fg)),
+            Span::styled(custom_rpc_display, Style::default().fg(theme().fg)),
         ]),
         Line::from(vec![
             Span::styled("  Config:     ", Style::default().fg(theme().fg_dim)),
@@ -3461,6 +3602,7 @@ fn render_settings(frame: &mut ratatui::prelude::Frame, area: Rect, app: &App) {
 
     frame.render_widget(
         Paragraph::new(network_section)
+            .wrap(Wrap { trim: false })
             .block(
                 Block::default()
                     .borders(Borders::ALL)
@@ -3472,6 +3614,7 @@ fn render_settings(frame: &mut ratatui::prelude::Frame, area: Rect, app: &App) {
     );
     frame.render_widget(
         Paragraph::new(wallet_section)
+            .wrap(Wrap { trim: false })
             .block(
                 Block::default()
                     .borders(Borders::ALL)
@@ -3483,6 +3626,7 @@ fn render_settings(frame: &mut ratatui::prelude::Frame, area: Rect, app: &App) {
     );
     frame.render_widget(
         Paragraph::new(shortcuts)
+            .wrap(Wrap { trim: false })
             .block(
                 Block::default()
                     .borders(Borders::ALL)
@@ -3630,13 +3774,49 @@ fn qr_text(value: &str) -> String {
     }
 }
 
+fn centered_modal(
+    area: Rect,
+    max_width: u16,
+    preferred_height: u16,
+    min_width: u16,
+    min_height: u16,
+) -> Rect {
+    let available_width = area.width.saturating_sub(2).max(1);
+    let available_height = area.height.saturating_sub(2).max(1);
+    let min_width = min_width.min(available_width).max(1);
+    let min_height = min_height.min(available_height).max(1);
+    let width = available_width.min(max_width).max(min_width);
+    let height = available_height.min(preferred_height).max(min_height);
+    Rect::new(
+        area.x + area.width.saturating_sub(width) / 2,
+        area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    )
+}
+
+fn render_opaque_modal_background(frame: &mut ratatui::prelude::Frame, area: Rect) {
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        Block::default().style(Style::default().bg(theme().surface)),
+        area,
+    );
+}
+
+fn modal_style() -> Style {
+    Style::default().fg(theme().fg).bg(theme().surface)
+}
+
+fn modal_block(title: &str, border_color: ratatui::style::Color) -> Block<'_> {
+    Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(border_color))
+        .style(Style::default().bg(theme().surface))
+        .title(title.to_string())
+}
+
 fn render_onboarding_modal(frame: &mut ratatui::prelude::Frame, app: &App) {
     let area = frame.area();
-    let modal_width = area.width.saturating_sub(6).min(86).max(24);
-    let modal_height = 11u16;
-    let x = area.x + (area.width.saturating_sub(modal_width)) / 2;
-    let y = area.y + (area.height.saturating_sub(modal_height)) / 2;
-    let modal = Rect::new(x, y, modal_width, modal_height);
 
     let (prompt, input_line, hints): (String, String, Vec<String>) = match app.onboarding.step {
         OnboardingStep::ChooseBackend => (
@@ -3695,25 +3875,20 @@ fn render_onboarding_modal(frame: &mut ratatui::prelude::Frame, app: &App) {
         lines.push(Line::from(app.onboarding.message.clone()));
     }
 
+    let preferred_height = (lines.len() as u16).saturating_add(2).min(16);
+    let modal = centered_modal(area, 86, preferred_height, 24, 8);
+    render_opaque_modal_background(frame, modal);
+
     let paragraph = Paragraph::new(Text::from(lines))
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(theme().border))
-                .title("Setup"),
-        )
-        .style(Style::default().fg(theme().fg));
+        .wrap(Wrap { trim: false })
+        .block(modal_block("Setup", theme().border))
+        .style(modal_style());
 
     frame.render_widget(paragraph, modal);
 }
 
 fn render_mnemonic_confirm_modal(frame: &mut ratatui::prelude::Frame, app: &App) {
     let area = frame.area();
-    let modal_width = area.width.saturating_sub(8).min(92).max(40);
-    let modal_height = 15u16.min(area.height.saturating_sub(2).max(8));
-    let x = area.x + (area.width.saturating_sub(modal_width)) / 2;
-    let y = area.y + (area.height.saturating_sub(modal_height)) / 2;
-    let modal = Rect::new(x, y, modal_width, modal_height);
 
     let pending = app.pending_mnemonic.as_ref();
     let phrase = pending
@@ -3740,15 +3915,14 @@ fn render_mnemonic_confirm_modal(frame: &mut ratatui::prelude::Frame, app: &App)
         Line::from("Esc cancels without storing."),
     ]);
 
+    let modal = centered_modal(area, 92, 15, 32, 8);
+    render_opaque_modal_background(frame, modal);
+
     frame.render_widget(
         Paragraph::new(content)
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .border_style(Style::default().fg(theme().yellow))
-                    .title("Backup Seed Phrase"),
-            )
-            .style(Style::default().fg(theme().fg)),
+            .wrap(Wrap { trim: false })
+            .block(modal_block("Backup Seed Phrase", theme().yellow))
+            .style(modal_style()),
         modal,
     );
 }
@@ -3758,11 +3932,6 @@ fn render_revealed_secret_modal(frame: &mut ratatui::prelude::Frame, app: &App) 
         return;
     };
     let area = frame.area();
-    let modal_width = area.width.saturating_sub(8).min(92).max(40);
-    let modal_height = 11u16.min(area.height.saturating_sub(2).max(7));
-    let x = area.x + (area.width.saturating_sub(modal_width)) / 2;
-    let y = area.y + (area.height.saturating_sub(modal_height)) / 2;
-    let modal = Rect::new(x, y, modal_width, modal_height);
 
     let content = Text::from(vec![
         Line::from(format!("Wallet: {}", secret.label)),
@@ -3775,26 +3944,20 @@ fn render_revealed_secret_modal(frame: &mut ratatui::prelude::Frame, app: &App) 
         Line::from("c copies to clipboard. Esc closes."),
     ]);
 
+    let modal = centered_modal(area, 92, 12, 32, 7);
+    render_opaque_modal_background(frame, modal);
+
     frame.render_widget(
         Paragraph::new(content)
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .border_style(Style::default().fg(theme().red))
-                    .title("Secret Revealed"),
-            )
-            .style(Style::default().fg(theme().fg)),
+            .wrap(Wrap { trim: false })
+            .block(modal_block("Secret Revealed", theme().red))
+            .style(modal_style()),
         modal,
     );
 }
 
 fn render_input_modal(frame: &mut ratatui::prelude::Frame, app: &App) {
     let area = frame.area();
-    let modal_width = area.width.saturating_sub(8).min(80).max(20);
-    let modal_height = 7u16;
-    let x = area.x + (area.width.saturating_sub(modal_width)) / 2;
-    let y = area.y + (area.height.saturating_sub(modal_height)) / 2;
-    let modal = Rect::new(x, y, modal_width, modal_height);
 
     let delete_name = app
         .accounts
@@ -3935,14 +4098,13 @@ fn render_input_modal(frame: &mut ratatui::prelude::Frame, app: &App) {
         Line::from("Esc to cancel"),
     ]);
 
+    let modal = centered_modal(area, 80, 8, 20, 6);
+    render_opaque_modal_background(frame, modal);
+
     let paragraph = Paragraph::new(content)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(theme().border))
-                .title(title),
-        )
-        .style(Style::default().fg(theme().fg));
+        .wrap(Wrap { trim: false })
+        .block(modal_block(title, theme().border))
+        .style(modal_style());
 
     frame.render_widget(paragraph, modal);
 }
@@ -5379,4 +5541,13 @@ fn short_address(value: &str) -> String {
         return value.to_string();
     }
     format!("{}...{}", &value[..4], &value[length - 4..])
+}
+
+fn short_display(value: &str, max_chars: usize) -> String {
+    let count = value.chars().count();
+    if count <= max_chars || max_chars <= 1 {
+        return value.to_string();
+    }
+    let keep = max_chars.saturating_sub(1);
+    format!("{}…", value.chars().take(keep).collect::<String>())
 }
