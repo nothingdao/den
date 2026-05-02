@@ -2,17 +2,25 @@
 
 Status: design target, not yet implemented.
 
-The Den daemon API is the stable local interface for browser extensions, scripts, and future clients. It should be documented and versioned so clients do not need to read Den config files, Keychain entries, or Rust internals directly.
+The Den daemon API is the stable local interface for browser extensions, native apps, scripts, games, Solana tooling, and future clients. Publicly, this should be framed as the **Den Local Wallet API**: a documented, versioned way for local applications to connect to wallets and request signatures without reading Den config files, Keychain entries, key-provider internals, or Rust implementation details directly.
 
 ## Transport
 
-Initial transport should optimize for browser-extension compatibility:
+The daemon core should be transport-agnostic. Multiple local transports can expose the same API semantics.
+
+Browser-compatible transport:
 
 ```text
 http://127.0.0.1:<ephemeral-or-configured-port>
 ```
 
-Future transports may include Unix domain sockets for non-browser local clients.
+Native/local transport:
+
+```text
+macOS/Linux Unix socket, e.g. $XDG_RUNTIME_DIR/den/den.sock
+```
+
+Unix sockets should be preferred for native apps, CLIs, scripts, and local Solana tooling. Browser extensions generally cannot open Unix sockets directly, so they use localhost HTTP or a future native-messaging bridge.
 
 Requirements:
 
@@ -20,6 +28,19 @@ Requirements:
 - no remote network exposure
 - explicit session authorization before privileged endpoints
 - version endpoint for compatibility checks
+
+## Native App Use Case
+
+A native app can add external Solana wallet signing by integrating with Den instead of embedding wallet/key logic:
+
+```text
+Native app
+  -> Den Unix socket API
+  -> Den daemon approval/session layer
+  -> Den key-storage/signing provider
+```
+
+The app does not need to know whether a key is backed by macOS Keychain, Linux Secret Service, an encrypted file, Bitwarden, Ledger, or another provider. Den owns storage, signing policy, and approval UX.
 
 ## API Versioning
 
@@ -276,6 +297,17 @@ Suggested codes:
 - `DEN_SIMULATION_FAILED`
 - `DEN_KEY_PROVIDER_UNAVAILABLE`
 
+## Client SDKs and Examples
+
+Once the API stabilizes, Den should provide small clients/examples:
+
+- Rust client for native apps and CLIs
+- TypeScript client for Node/Electron/local tooling
+- browser-extension integration example over localhost HTTP
+- Unix socket JSON-RPC examples
+
+SDKs should be thin wrappers around the documented API, not privileged internal integrations.
+
 ## Documentation Requirement
 
 The daemon API must be documented as a public local API before external clients depend on it. Documentation should include:
@@ -285,5 +317,6 @@ The daemon API must be documented as a public local API before external clients 
 - auth/session lifecycle
 - error codes
 - example browser-extension flow
+- example native app Unix socket flow
 - example script/client flow
 - compatibility/version policy

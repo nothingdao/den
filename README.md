@@ -2,7 +2,7 @@
 
 Terminal wallet dashboard for Solana, built with Ratatui. It can show live balances and recent activity via Helius, or run in a placeholder mode when no credentials are set.
 
-Den is also the planned local wallet authority for the broader Den ecosystem: the TUI/CLI owns wallet management and secret storage, a future local daemon will expose a documented API, and browser clients such as `den-browser-extension` will connect to Den instead of storing keys themselves.
+Den is also the planned local wallet authority and signing service for the broader Den ecosystem: the TUI/CLI owns wallet management and secret storage, a future local daemon will expose a documented Den Local Wallet API, and browser/native clients will connect to Den instead of storing keys themselves.
 
 ## Install
 
@@ -24,7 +24,7 @@ den
 ```
 
 ## Features
-- Local wallet authority for Den clients, with daemon/API design in progress
+- Local wallet authority and signing service for browser extensions, native apps, scripts, and future Den clients
 - Multi-tab wallet overview (accounts, tokens, history, address book, settings)
 - Live balance + token fetch from Helius RPC with non-blocking TUI refreshes
 - Keychain-backed key import, generation, and 12-word seed wallet restore (macOS)
@@ -118,7 +118,7 @@ Configuration:
 
 ## Product Ecosystem / Daemon API
 
-The browser extension should be a thin Den client, not an independent wallet. When the daemon work lands, the extension will show wallet state and dApp approval UI while Den owns keys, permissions, and signing.
+The browser extension should be a thin Den client, not an independent wallet. Native apps can also use Den as an external Solana wallet/signing provider over Unix sockets. When the daemon work lands, clients will show wallet state and approval UI while Den owns keys, permissions, and signing.
 
 Design docs:
 
@@ -126,10 +126,12 @@ Design docs:
 - `docs/architecture/daemon-api.md`
 - `docs/architecture/key-storage-api.md`
 - `docs/architecture/linux-support.md`
+- `docs/architecture/native-app-integration.md`
 
-Daemon API goals:
+Den Local Wallet API goals:
 
 - documented, versioned local API for any client to build against
+- Unix socket transport for native apps, games, CLIs, scripts, and local Solana tooling
 - terminal-authorized client sessions
 - wallet CRUD for non-secret operations
 - signing APIs that never expose private keys

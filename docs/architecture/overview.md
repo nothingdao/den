@@ -4,14 +4,14 @@
 
 Den is currently implemented primarily in `src/main.rs`, with theme loading isolated in `src/theme.rs`. Application state, TUI rendering, CLI handling, config logic, wallet management, contacts, and network fetches still mostly live in the main module.
 
-The product direction is for Den to become the local wallet authority for multiple clients. The TUI/CLI remains first-class, while a future local daemon exposes a documented, versioned API for browser extensions, scripts, and other clients. See `product-ecosystem.md`, `daemon-api.md`, and `key-storage-api.md`.
+The product direction is for Den to become the local wallet authority and signing service for multiple clients. The TUI/CLI remains first-class, while a future local daemon exposes a documented, versioned Den Local Wallet API for browser extensions, native apps, games, CLIs, scripts, Solana tooling, and other clients. See `product-ecosystem.md`, `daemon-api.md`, `native-app-integration.md`, and `key-storage-api.md`.
 
 ## Major Subsystems
 
 - TUI: Ratatui/Crossterm rendering, keyboard handling, responsive header tabs/compact navigation, opaque modals
 - CLI: headless wallet/config/contact commands exposed through `den --help`
 - Wallets: full wallets and watch-only wallets, with active-wallet selection, random key generation, and 12-word seed phrase create/restore
-- Future daemon/client ecosystem: local-only API, terminal-authorized extension sessions, documented wallet/signing APIs
+- Future daemon/client ecosystem: local-only API, Unix socket native transport, terminal-authorized client sessions, documented wallet/signing APIs
 - Config: local file backend plus optional Bitwarden-backed sync
 - Contacts: persisted contact list with JSON import/export
 - Network data: Helius requests for balances, tokens, NFTs, and history run on a background refresh worker; custom RPC supports standard RPC balance/history/sends without DAS metadata
@@ -106,6 +106,7 @@ The binary users run is `den`.
 ## Related Design Docs
 
 - `product-ecosystem.md` — Den TUI/daemon/browser-extension product roles
-- `daemon-api.md` — proposed documented local API for Den clients
+- `daemon-api.md` — proposed documented Den Local Wallet API for browser and native clients
 - `key-storage-api.md` — provider abstraction for Keychain, encrypted files, hardware signers, and other backends
 - `linux-support.md` — Linux/XDG paths, Secret Service, encrypted-file fallback, Unix sockets, and packaging roadmap
+- `native-app-integration.md` — native app/game/script integration through Unix sockets

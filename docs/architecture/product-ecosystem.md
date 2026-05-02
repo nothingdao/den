@@ -1,6 +1,6 @@
 # Den Product Ecosystem
 
-Den is the local wallet authority for the NothingDAO wallet ecosystem. The terminal app, local daemon, browser extension, and future clients should share one wallet model and one secret-storage policy.
+Den is the local wallet authority and signing service for the NothingDAO wallet ecosystem. The terminal app, local daemon, browser extension, native app integrations, and future clients should share one wallet model and one secret-storage policy.
 
 ## Product Roles
 
@@ -23,6 +23,11 @@ Den browser extension
   - talks to the Den daemon for wallets, connect, and signing
   - stores only non-secret client/session state
 
+Native app clients
+  - games, desktop apps, CLIs, scripts, and local Solana tooling
+  - use the Den Local Wallet API over Unix sockets where possible
+  - add external wallet signing without embedding key storage
+
 Future clients
   - desktop UI, scripts, local services, or game clients
   - use the documented daemon API instead of reading Den internals
@@ -32,7 +37,9 @@ Future clients
 
 The browser extension is not a wallet. It is a Den client.
 
-Private keys, seed phrases, signing policy, and backup/reveal flows belong to Den core. Browser clients should never store or receive secret material.
+Native apps should also treat Den as an external wallet/signing authority instead of storing Solana keys themselves.
+
+Private keys, seed phrases, signing policy, and backup/reveal flows belong to Den core. Clients should never store or receive secret material unless they are explicitly implementing a trusted Den key-storage provider.
 
 ## Target UX
 
@@ -54,6 +61,23 @@ Run `den` in your terminal to start the daemon.
 ```
 
 No fallback key store should be used in the extension.
+
+## Native App Integration
+
+Unix sockets make Den useful beyond browser wallets. Native games, desktop apps, scripts, and Solana dev tools can connect to Den locally and request wallet connection/signing through the same session and approval model.
+
+Example:
+
+```text
+Native app
+  -> Den Unix socket API
+  -> Den daemon approval/session layer
+  -> Den key-storage provider
+```
+
+This lets apps add external Solana wallet signing without embedding wallet logic, parsing Den config, or handling private keys.
+
+See `native-app-integration.md`.
 
 ## Extension CRUD Scope
 
@@ -88,7 +112,7 @@ Sensitive operations require Den approval, preferably in the terminal/TUI:
 - Transaction signing requires explicit approval initially.
 - Watch-only wallets never sign.
 - Secret reveal/export is never exposed to browser clients.
-- The daemon API is stable and documented so third-party clients do not depend on private files or implementation details.
+- The daemon API is stable and documented as the Den Local Wallet API so third-party clients do not depend on private files or implementation details.
 
 ## Implementation Phases
 
@@ -99,4 +123,6 @@ Sensitive operations require Den approval, preferably in the terminal/TUI:
 5. Route extension connect/sign-message/sign-transaction through the daemon.
 6. Remove hardcoded keys from `den-browser-extension`.
 7. Add origin permissions, daemon lifecycle management, and richer TUI controls.
-8. Refactor Den internals so the TUI and CLI become clients of Den core/daemon APIs where appropriate.
+8. Add Unix socket JSON-RPC support for native apps and CLIs.
+9. Publish example Den Local Wallet API clients for Rust and TypeScript.
+10. Refactor Den internals so the TUI and CLI become clients of Den core/daemon APIs where appropriate.
